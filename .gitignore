@@ -42,6 +42,7 @@ yarn-error.log*
 next-env.d.ts
 
 # ios
-ios/Post/DerivedData/
+ios/Yesterday/DerivedData/
+ios/Yesterday/Yesterday/yesterday/
 xcuserdata/
 *.xcuserstate
