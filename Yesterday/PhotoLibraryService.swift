@@ -1,6 +1,9 @@
 import Photos
 import UIKit
 import Vision
+import CoreLocation
+
+/// Talks to your Camera Roll and the Post album.
 
 struct PhotoSummary: Identifiable, Sendable, Hashable {
     var id: String { localIdentifier }
@@ -9,6 +12,16 @@ struct PhotoSummary: Identifiable, Sendable, Hashable {
     let isFavorite: Bool
     let isScreenshot: Bool
     let hasLocation: Bool
+    let latitude: Double?
+    let longitude: Double?
+    let pixelWidth: Int
+    let pixelHeight: Int
+    let burstIdentifier: String?
+
+    var coordinate: CLLocationCoordinate2D? {
+        guard let latitude, let longitude else { return nil }
+        return CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
 }
 
 struct AlbumSummary: Identifiable, Sendable, Hashable {
@@ -32,10 +45,13 @@ final class PhotoLibraryService: @unchecked Sendable {
     var authorization: PHAuthorizationStatus
     var postAlbumIDs: [String] = []
     var albums: [AlbumSummary] = []
+    var peopleAlbums: [AlbumSummary] = []
+    var homePin: (latitude: Double, longitude: Double)?
     var visibleImageCount: Int = 0
     var lastResultIDs: [String] = []
     var previewIDs: [String] = []
     var previewTitle: String = ""
+    var labelCache: [String: [String]] = [:]
     private var producedResultsThisTurn = false
 
     private let imageManager = PHCachingImageManager()
@@ -57,8 +73,12 @@ final class PhotoLibraryService: @unchecked Sendable {
     func refresh() async {
         guard canRead else { return }
         albums = fetchAlbums()
+        peopleAlbums = fetchPeopleAlbums()
         postAlbumIDs = fetchPostAlbumIDs()
         visibleImageCount = PHAsset.fetchAssets(with: .image, options: nil).count
+        if homePin == nil {
+            homePin = estimateHomePin()
+        }
     }
 
     func search(
@@ -99,6 +119,174 @@ final class PhotoLibraryService: @unchecked Sendable {
         return photos
     }
 
+    func photos(
+        inCollectionID collectionID: String?,
+        start: Date?,
+        end: Date?,
+        favoritesOnly: Bool,
+        locatedOnly: Bool,
+        limit: Int,
+        scanCap: Int = 12_000
+    ) -> [PhotoSummary] {
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.predicate = imagePredicate(start: start, end: end, favoritesOnly: favoritesOnly)
+
+        let fetch: PHFetchResult<PHAsset>
+        if let collectionID,
+           let album = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [collectionID], options: nil).firstObject {
+            fetch = PHAsset.fetchAssets(in: album, options: options)
+        } else if let recents = cameraRoll() {
+            fetch = PHAsset.fetchAssets(in: recents, options: options)
+        } else {
+            fetch = PHAsset.fetchAssets(with: .image, options: options)
+        }
+
+        var photos: [PhotoSummary] = []
+        var scanned = 0
+        fetch.enumerateObjects { asset, _, stop in
+            scanned += 1
+            if asset.mediaType != .image { return }
+            if asset.mediaSubtypes.contains(.photoScreenshot) { return }
+            if locatedOnly, asset.location == nil { return }
+            photos.append(Self.summary(for: asset))
+            if photos.count >= limit || scanned >= scanCap { stop.pointee = true }
+        }
+        lastResultIDs = photos.map(\.localIdentifier)
+        producedResultsThisTurn = true
+        return photos
+    }
+
+    /// Walks Camera Roll for shots actually near a pin, not just the newest GPS photos.
+    func photosNear(
+        latitude: Double,
+        longitude: Double,
+        radius: CLLocationDistance,
+        start: Date?,
+        end: Date?,
+        favoritesOnly: Bool,
+        limit: Int,
+        scanCap: Int = 80_000
+    ) -> [PhotoSummary] {
+        let target = CLLocation(latitude: latitude, longitude: longitude)
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.predicate = imagePredicate(start: start, end: end, favoritesOnly: favoritesOnly)
+
+        let fetch: PHFetchResult<PHAsset>
+        if let recents = cameraRoll() {
+            fetch = PHAsset.fetchAssets(in: recents, options: options)
+        } else {
+            fetch = PHAsset.fetchAssets(with: .image, options: options)
+        }
+
+        var photos: [PhotoSummary] = []
+        var scanned = 0
+        fetch.enumerateObjects { asset, _, stop in
+            scanned += 1
+            if asset.mediaType != .image { return }
+            if asset.mediaSubtypes.contains(.photoScreenshot) { return }
+            guard let location = asset.location, location.distance(from: target) <= radius else { return }
+            photos.append(Self.summary(for: asset))
+            if photos.count >= limit || scanned >= scanCap { stop.pointee = true }
+        }
+        lastResultIDs = photos.map(\.localIdentifier)
+        producedResultsThisTurn = true
+        return photos
+    }
+
+    func photosInRegion(
+        latitude: Double,
+        longitude: Double,
+        latitudeDelta: Double,
+        longitudeDelta: Double,
+        start: Date?,
+        end: Date?,
+        favoritesOnly: Bool,
+        limit: Int,
+        scanCap: Int = 200_000
+    ) -> [PhotoSummary] {
+        let latMin = latitude - latitudeDelta / 2
+        let latMax = latitude + latitudeDelta / 2
+        let lonMin = longitude - longitudeDelta / 2
+        let lonMax = longitude + longitudeDelta / 2
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.predicate = imagePredicate(start: start, end: end, favoritesOnly: favoritesOnly)
+
+        let fetch: PHFetchResult<PHAsset>
+        if let recents = cameraRoll() {
+            fetch = PHAsset.fetchAssets(in: recents, options: options)
+        } else {
+            fetch = PHAsset.fetchAssets(with: .image, options: options)
+        }
+
+        var photos: [PhotoSummary] = []
+        var scanned = 0
+        fetch.enumerateObjects { asset, _, stop in
+            scanned += 1
+            if asset.mediaType != .image { return }
+            if asset.mediaSubtypes.contains(.photoScreenshot) { return }
+            guard let location = asset.location else { return }
+            let lat = location.coordinate.latitude
+            let lon = location.coordinate.longitude
+            guard lat >= latMin, lat <= latMax, lon >= lonMin, lon <= lonMax else { return }
+            photos.append(Self.summary(for: asset))
+            if photos.count >= limit || scanned >= scanCap { stop.pointee = true }
+        }
+        lastResultIDs = photos.map(\.localIdentifier)
+        producedResultsThisTurn = true
+        return photos
+    }
+
+    func placeName(latitude: Double, longitude: Double) async -> String {
+        let key = "\(Int((latitude * 20).rounded())):\(Int((longitude * 20).rounded()))"
+        if let cached = Self.placeNameCache[key] { return cached }
+        do {
+            let marks = try await CLGeocoder().reverseGeocodeLocation(
+                CLLocation(latitude: latitude, longitude: longitude)
+            )
+            let mark = marks.first
+            let name = mark?.locality
+                ?? mark?.subAdministrativeArea
+                ?? mark?.administrativeArea
+                ?? mark?.country
+                ?? "There"
+            Self.placeNameCache[key] = name
+            return name
+        } catch {
+            return "There"
+        }
+    }
+
+    private static var placeNameCache: [String: String] = [:]
+
+    /// Camera Roll shots that actually have a GPS pin, not just the newest 200 photos.
+    func locatedPhotos(limit: Int = 220, scanCap: Int = 2500) -> [PhotoSummary] {
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        guard let recents = cameraRoll() else { return [] }
+        let fetch = PHAsset.fetchAssets(in: recents, options: options)
+        var photos: [PhotoSummary] = []
+        var scanned = 0
+        fetch.enumerateObjects { asset, _, stop in
+            scanned += 1
+            if asset.mediaType != .image { return }
+            if asset.mediaSubtypes.contains(.photoScreenshot) { return }
+            guard asset.location != nil else {
+                if scanned >= scanCap { stop.pointee = true }
+                return
+            }
+            photos.append(Self.summary(for: asset))
+            if photos.count >= limit || scanned >= scanCap { stop.pointee = true }
+        }
+        return photos
+    }
+
     func photos(on day: Date, limit: Int = 80) -> [PhotoSummary] {
         let start = Calendar.current.startOfDay(for: day)
         guard let end = Calendar.current.date(byAdding: .day, value: 1, to: start) else {
@@ -110,10 +298,48 @@ final class PhotoLibraryService: @unchecked Sendable {
     struct PhotoEvent {
         var photos: [PhotoSummary]
         var eventDay: Date
-        var isMorning: Bool
+        var isMorning: Bool { stretch == .morning }
+
+        var kindName: String {
+            switch stretch {
+            case .morning: return "Morning"
+            case .afternoon: return "Afternoon"
+            case .evening, .lateNight: return "Night"
+            }
+        }
+
+        var stretch: DaySlice {
+            let slices = photos.compactMap(\.createdAt).map(DaySlice.of)
+            guard !slices.isEmpty else { return .afternoon }
+            let morning = slices.filter { $0 == .morning }.count
+            let afternoon = slices.filter { $0 == .afternoon }.count
+            let night = slices.filter { $0 == .evening || $0 == .lateNight }.count
+            let best = max(morning, afternoon, night)
+            if best == morning { return .morning }
+            if best == afternoon { return .afternoon }
+            return .evening
+        }
+
+        var timeRangeLabel: String {
+            let times = photos.compactMap(\.createdAt).sorted()
+            guard let first = times.first, let last = times.last else { return "" }
+            if Calendar.current.isDate(first, inSameDayAs: last) {
+                return "\(DateFormatter.clock.string(from: first)) – \(DateFormatter.clock.string(from: last))"
+            }
+            return "\(DateFormatter.dayClock.string(from: first)) – \(DateFormatter.dayClock.string(from: last))"
+        }
     }
 
     func eventPhotos(on days: [Date], part: DayPart) -> [PhotoSummary] {
+        let moments = eventMoments(on: days, part: part)
+        let picked = moments.flatMap(\.photos)
+        lastResultIDs = picked.map(\.localIdentifier)
+        producedResultsThisTurn = true
+        return picked
+    }
+
+    /// Groups Camera Roll shots into nights vs mornings using gaps in time.
+    func eventMoments(on days: [Date], part: DayPart) -> [PhotoEvent] {
         let calendar = Calendar.current
         let uniqueDays = Array(Set(days.map { calendar.startOfDay(for: $0) })).sorted()
         guard let firstDay = uniqueDays.first, let lastDay = uniqueDays.last else { return [] }
@@ -133,25 +359,22 @@ final class PhotoLibraryService: @unchecked Sendable {
         func matches(_ event: PhotoEvent) -> Bool {
             guard wanted.contains(event.eventDay) else { return false }
             switch part {
-            case .posting:
-                return !event.isMorning
-            case .morning:
-                return event.isMorning
-            case .afternoon:
-                return event.photos.contains { hour(of: $0, in: 12..<17) }
-            case .evening:
-                return event.photos.contains { hour(of: $0, in: 17..<24) || hour(of: $0, in: 0..<6) }
-            case .allDay:
+            case .posting, .allDay:
                 return true
+            case .morning:
+                return event.stretch == .morning
+            case .afternoon:
+                return event.stretch == .afternoon
+            case .evening:
+                return event.stretch == .evening || event.stretch == .lateNight
             }
         }
 
-        var picked = events.filter(matches).flatMap(\.photos)
-        if picked.isEmpty, part == .posting {
-            picked = events.filter { wanted.contains($0.eventDay) }.flatMap(\.photos)
+        var picked = events.filter(matches)
+        if picked.isEmpty {
+            picked = events.filter { wanted.contains($0.eventDay) }
         }
-        picked.sort { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
-        lastResultIDs = picked.map(\.localIdentifier)
+        lastResultIDs = picked.flatMap(\.photos).map(\.localIdentifier)
         producedResultsThisTurn = true
         return picked
     }
@@ -159,18 +382,32 @@ final class PhotoLibraryService: @unchecked Sendable {
     private func clusterEvents(_ photos: [PhotoSummary]) -> [PhotoEvent] {
         let sorted = photos.sorted { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
         guard let first = sorted.first else { return [] }
-        let gap: TimeInterval = 4.5 * 3600
         var groups: [[PhotoSummary]] = [[first]]
         for photo in sorted.dropFirst() {
             let previous = groups[groups.count - 1].last
-            let delta = (photo.createdAt ?? .distantPast).timeIntervalSince(previous?.createdAt ?? .distantPast)
-            if delta > gap {
+            if shouldStartNewMoment(from: previous?.createdAt, to: photo.createdAt) {
                 groups.append([photo])
             } else {
                 groups[groups.count - 1].append(photo)
             }
         }
         return groups.map(makeEvent)
+    }
+
+    /// Morning, afternoon, and night are separate. A night can run past midnight.
+    private func shouldStartNewMoment(from previous: Date?, to current: Date?) -> Bool {
+        guard let previous, let current else { return false }
+        if current.timeIntervalSince(previous) > 3 * 3600 { return true }
+        let before = DaySlice.of(previous)
+        let after = DaySlice.of(current)
+        if before == after { return false }
+        if isSameNight(before, after) { return false }
+        return true
+    }
+
+    private func isSameNight(_ a: DaySlice, _ b: DaySlice) -> Bool {
+        let night: Set<DaySlice> = [.evening, .lateNight]
+        return night.contains(a) && night.contains(b)
     }
 
     private func makeEvent(_ photos: [PhotoSummary]) -> PhotoEvent {
@@ -186,14 +423,7 @@ final class PhotoLibraryService: @unchecked Sendable {
         } else {
             eventDay = calendar.startOfDay(for: times.min() ?? Date())
         }
-        let hours = times.map { calendar.component(.hour, from: $0) }
-        let isMorning = hours.allSatisfy { $0 < 13 } && !hours.contains(where: { $0 >= 16 })
-        return PhotoEvent(photos: photos, eventDay: eventDay, isMorning: isMorning)
-    }
-
-    private func hour(of photo: PhotoSummary, in range: Range<Int>) -> Bool {
-        guard let date = photo.createdAt else { return false }
-        return range.contains(Calendar.current.component(.hour, from: date))
+        return PhotoEvent(photos: photos, eventDay: eventDay)
     }
 
     func clusterRecent(dayCount: Int, maxGroups: Int) -> [DayGroup] {
@@ -266,6 +496,27 @@ final class PhotoLibraryService: @unchecked Sendable {
         return "Post album now has \(count) photo\(count == 1 ? "" : "s")."
     }
 
+    func createSavedAlbum(title: String, ids: [String]) async throws -> String {
+        var placeholder: PHObjectPlaceholder?
+        try await PHPhotoLibrary.shared().performChanges {
+            let request = PHAssetCollectionChangeRequest.creationRequestForAssetCollection(withTitle: title)
+            placeholder = request.placeholderForCreatedAssetCollection
+        }
+        guard let identifier = placeholder?.localIdentifier,
+              let album = PHAssetCollection.fetchAssetCollections(withLocalIdentifiers: [identifier], options: nil).firstObject
+        else {
+            throw PhotoLibraryError.couldNotCreateAlbum
+        }
+        let incoming = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        let current = PHAsset.fetchAssets(in: album, options: nil)
+        try await PHPhotoLibrary.shared().performChanges {
+            guard let request = PHAssetCollectionChangeRequest(for: album, assets: current) else { return }
+            request.addAssets(incoming)
+        }
+        await refresh()
+        return identifier
+    }
+
     func summaries(for ids: [String]) -> [PhotoSummary] {
         let fetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
         var photos: [PhotoSummary] = []
@@ -279,32 +530,96 @@ final class PhotoLibraryService: @unchecked Sendable {
         return photos.sorted { (order[$0.localIdentifier] ?? 0) < (order[$1.localIdentifier] ?? 0) }
     }
 
+    struct SimilarGroup: Identifiable {
+        var id: String { photoIDs[0] }
+        let photoIDs: [String]
+    }
+
+    /// Bursts and shots taken a few seconds apart — the same moment, not the whole night.
+    func similarGroups(from ids: [String], window: TimeInterval = 8) -> [SimilarGroup] {
+        let photos = summaries(for: ids)
+        let byID = Dictionary(uniqueKeysWithValues: photos.map { ($0.localIdentifier, $0) })
+        var groups: [[String]] = []
+        for id in ids {
+            let photo = byID[id]
+            if let lastID = groups.last?.last {
+                let previous = byID[lastID]
+                let sameBurst = {
+                    guard let a = previous?.burstIdentifier, let b = photo?.burstIdentifier, !a.isEmpty else { return false }
+                    return a == b
+                }()
+                let closeInTime = {
+                    guard let a = previous?.createdAt, let b = photo?.createdAt else { return false }
+                    return abs(b.timeIntervalSince(a)) <= window
+                }()
+                let lastCount = groups[groups.count - 1].count
+                if sameBurst || (closeInTime && lastCount < 24) {
+                    groups[groups.count - 1].append(id)
+                    continue
+                }
+            }
+            groups.append([id])
+        }
+        return groups.map { SimilarGroup(photoIDs: $0) }
+    }
+
     func requestThumbnail(for id: String, size: CGSize) async -> UIImage? {
+        await requestImage(for: id, size: size, fit: .aspectFill, sharp: true)
+    }
+
+    func requestDisplayImage(for id: String, size: CGSize) async -> UIImage? {
+        await requestImage(for: id, size: size, fit: .aspectFit, sharp: true)
+    }
+
+    private func requestImage(
+        for id: String,
+        size: CGSize,
+        fit: PHImageContentMode,
+        sharp: Bool
+    ) async -> UIImage? {
         let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
         guard let asset = fetch.firstObject else { return nil }
         let options = PHImageRequestOptions()
-        options.deliveryMode = .highQualityFormat
-        options.resizeMode = .fast
+        options.deliveryMode = sharp ? .highQualityFormat : .opportunistic
+        options.resizeMode = sharp ? .exact : .fast
         options.version = .current
         options.isNetworkAccessAllowed = true
+        options.isSynchronous = false
         let scale = UIScreen.main.scale
-        let pixels = CGSize(width: size.width * scale, height: size.height * scale)
+        let pixels = CGSize(width: max(size.width, 1) * scale, height: max(size.height, 1) * scale)
         return await withCheckedContinuation { continuation in
             var finished = false
-            imageManager.requestImage(
+            PHImageManager.default().requestImage(
                 for: asset,
                 targetSize: pixels,
-                contentMode: .aspectFill,
+                contentMode: fit,
                 options: options
             ) { image, info in
-                guard !finished else { return }
-                if (info?[PHImageCancelledKey] as? Bool) == true {
+                if (info?[PHImageCancelledKey] as? Bool) == true || info?[PHImageErrorKey] != nil {
+                    guard !finished else { return }
                     finished = true
                     continuation.resume(returning: nil)
                     return
                 }
-                finished = true
-                continuation.resume(returning: image)
+                let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) == true
+                if sharp {
+                    if degraded { return }
+                    guard !finished else { return }
+                    finished = true
+                    continuation.resume(returning: image)
+                    return
+                }
+                if let image {
+                    guard !finished else { return }
+                    finished = true
+                    continuation.resume(returning: image)
+                    return
+                }
+                if !degraded {
+                    guard !finished else { return }
+                    finished = true
+                    continuation.resume(returning: nil)
+                }
             }
         }
     }
@@ -337,6 +652,60 @@ final class PhotoLibraryService: @unchecked Sendable {
         Post is the output album (\(postAlbumIDs.count) photos) — do not treat it as the search result.
         Other albums: \(albums.prefix(12).map(\.title).joined(separator: ", ")).
         """
+    }
+
+    private func fetchPeopleAlbums() -> [AlbumSummary] {
+        var rows: [AlbumSummary] = []
+        var seen = Set<String>()
+        let lists = PHCollectionList.fetchCollectionLists(with: .smartFolder, subtype: .smartFolderFaces, options: nil)
+        lists.enumerateObjects { list, _, _ in
+            let collections = PHCollection.fetchCollections(in: list, options: nil)
+            collections.enumerateObjects { item, _, _ in
+                guard let album = item as? PHAssetCollection else { return }
+                let title = (album.localizedTitle ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+                guard title.count >= 2 else { return }
+                let lowered = title.lowercased()
+                if lowered == "people" || lowered == "person" { return }
+                let count = PHAsset.fetchAssets(in: album, options: nil).count
+                guard count > 0, seen.insert(album.localIdentifier).inserted else { return }
+                rows.append(
+                    AlbumSummary(
+                        localIdentifier: album.localIdentifier,
+                        title: title,
+                        count: count
+                    )
+                )
+            }
+        }
+        return rows.sorted { $0.count > $1.count }
+    }
+
+    private func estimateHomePin() -> (latitude: Double, longitude: Double)? {
+        let samples = locatedPhotos(limit: 400, scanCap: 2500)
+        var buckets: [String: (count: Int, lat: Double, lon: Double)] = [:]
+        for photo in samples {
+            guard let lat = photo.latitude, let lon = photo.longitude else { continue }
+            let key = "\(Int((lat * 80).rounded())):\(Int((lon * 80).rounded()))"
+            if var bucket = buckets[key] {
+                bucket.count += 1
+                bucket.lat += lat
+                bucket.lon += lon
+                buckets[key] = bucket
+            } else {
+                buckets[key] = (1, lat, lon)
+            }
+        }
+        guard let best = buckets.values.max(by: { $0.count < $1.count }), best.count >= 8 else {
+            return nil
+        }
+        return (best.lat / Double(best.count), best.lon / Double(best.count))
+    }
+
+    func distanceMeters(from photo: PhotoSummary, latitude: Double, longitude: Double) -> CLLocationDistance? {
+        guard let lat = photo.latitude, let lon = photo.longitude else { return nil }
+        let here = CLLocation(latitude: lat, longitude: lon)
+        let there = CLLocation(latitude: latitude, longitude: longitude)
+        return here.distance(from: there)
     }
 
     private func fetchAlbums() -> [AlbumSummary] {
@@ -433,17 +802,22 @@ final class PhotoLibraryService: @unchecked Sendable {
             createdAt: asset.creationDate,
             isFavorite: asset.isFavorite,
             isScreenshot: asset.mediaSubtypes.contains(.photoScreenshot),
-            hasLocation: asset.location != nil
+            hasLocation: asset.location != nil,
+            latitude: asset.location?.coordinate.latitude,
+            longitude: asset.location?.coordinate.longitude,
+            pixelWidth: asset.pixelWidth,
+            pixelHeight: asset.pixelHeight,
+            burstIdentifier: asset.burstIdentifier
         )
     }
 
-    private static func classify(cgImage: CGImage) async -> [String] {
+    static func classify(cgImage: CGImage) async -> [String] {
         await withCheckedContinuation { continuation in
             let request = VNClassifyImageRequest { request, _ in
                 let observations = (request.results as? [VNClassificationObservation] ?? [])
-                    .prefix(4)
-                    .filter { $0.confidence >= 0.2 }
-                    .map { "\($0.identifier) \(Int($0.confidence * 100))%" }
+                    .prefix(8)
+                    .filter { $0.confidence >= 0.12 }
+                    .map(\.identifier)
                 continuation.resume(returning: observations.isEmpty ? ["unlabeled"] : Array(observations))
             }
             let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
@@ -452,6 +826,19 @@ final class PhotoLibraryService: @unchecked Sendable {
             } catch {
                 continuation.resume(returning: ["classification failed"])
             }
+        }
+    }
+}
+
+enum DaySlice {
+    case lateNight, morning, afternoon, evening
+
+    static func of(_ date: Date) -> DaySlice {
+        switch Calendar.current.component(.hour, from: date) {
+        case 0..<6: return .lateNight
+        case 6..<12: return .morning
+        case 12..<18: return .afternoon
+        default: return .evening
         }
     }
 }
@@ -475,6 +862,18 @@ private extension DateFormatter {
     static let shortStamp: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "h:mma"
+        return formatter
+    }()
+
+    static let clock: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "h:mma"
+        return formatter
+    }()
+
+    static let dayClock: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "EEE h:mma"
         return formatter
     }()
 }

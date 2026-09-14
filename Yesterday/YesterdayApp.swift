@@ -7,9 +7,11 @@ struct YesterdayApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ChatView()
+            RootView()
                 .environment(library)
                 .environment(chat)
+                .environment(SavedPostsStore.shared)
+                .preferredColorScheme(.dark)
         }
     }
 }

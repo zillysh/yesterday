@@ -17,25 +17,22 @@ struct ChatView: View {
                     PermissionView()
                 }
             }
-            .background(MessageTheme.background)
-            .navigationTitle("Yesterday")
-            .navigationBarTitleDisplayMode(.inline)
+            .background(MessageTheme.background.ignoresSafeArea())
             .toolbar {
                 ToolbarItem(placement: .principal) {
-                    VStack(spacing: 1) {
-                        Text("Yesterday")
-                            .font(.headline)
-                        Text(statusLine)
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                    }
+                    Text("Yesterday")
+                        .font(.headline)
+                        .foregroundStyle(.white)
                 }
                 if library.isLimited {
                     ToolbarItem(placement: .topBarTrailing) {
                         Button("More Photos") { showLimitedPicker = true }
+                            .foregroundStyle(.white.opacity(0.8))
                     }
                 }
             }
+            .toolbarBackground(MessageTheme.background, for: .navigationBar)
+            .toolbarBackground(.visible, for: .navigationBar)
             .task {
                 if library.canRead {
                     await library.refresh()
@@ -47,11 +44,6 @@ struct ChatView: View {
         }
     }
 
-    private var statusLine: String {
-        let count = library.postAlbumIDs.count
-        return "\(chat.modelNote) · \(count) in Post album"
-    }
-
     private func thread(chat: ChatViewModel) -> some View {
         @Bindable var chat = chat
         return VStack(spacing: 0) {
@@ -59,7 +51,7 @@ struct ChatView: View {
                 Button {
                     showLimitedPicker = true
                 } label: {
-                    Text("Only seeing \(library.visibleImageCount) allowed photos. Tap to pick your real camera roll.")
+                    Text("Only seeing \(library.visibleImageCount) allowed photos. Tap for your real camera roll.")
                         .font(.footnote)
                         .foregroundStyle(.white)
                         .frame(maxWidth: .infinity)
@@ -69,11 +61,10 @@ struct ChatView: View {
                 }
                 .buttonStyle(.plain)
             }
-            PostAlbumStrip()
-            Divider()
+
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: 10) {
+                    LazyVStack(alignment: .leading, spacing: 22) {
                         if chat.messages.isEmpty {
                             emptyState
                         }
@@ -82,12 +73,15 @@ struct ChatView: View {
                                 .id(message.id)
                         }
                         if chat.isSending {
-                            TypingBubble()
+                            Text("Looking through your camera roll…")
+                                .font(.body)
+                                .foregroundStyle(.white.opacity(0.55))
                                 .id("typing")
                         }
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 16)
+                    .padding(.horizontal, 18)
+                    .padding(.top, 12)
+                    .padding(.bottom, 24)
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .onChange(of: chat.messages.count) {
@@ -96,12 +90,14 @@ struct ChatView: View {
                     }
                 }
             }
+
             if let saveError = chat.saveError {
                 Text(saveError)
                     .font(.caption)
                     .foregroundStyle(.red)
                     .padding(.horizontal)
             }
+
             ComposerBar(text: $chat.draft, enabled: !chat.isSending) {
                 Task { await chat.send() }
             }
@@ -109,29 +105,19 @@ struct ChatView: View {
     }
 
     private var emptyState: some View {
-        VStack(spacing: 8) {
-            Text("Ask for a day, a weekend, or a group.")
+        VStack(alignment: .leading, spacing: 14) {
+            Text("What are you looking for?")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white)
+            Text("Type what you remember, or tap one of these.")
                 .font(.body)
-                .foregroundStyle(.secondary)
-            Text("I’ll put the keepers in your Post album.")
-                .font(.footnote)
-                .foregroundStyle(.tertiary)
+                .foregroundStyle(.white.opacity(0.45))
+            SuggestionChipRow(enabled: true) { preset in
+                Task { await chat.sendPreset(preset) }
+            }
         }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 48)
-    }
-}
-
-private struct TypingBubble: View {
-    var body: some View {
-        HStack {
-            Text("…")
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(MessageTheme.incoming)
-                .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-            Spacer(minLength: 48)
-        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 28)
     }
 }
 
