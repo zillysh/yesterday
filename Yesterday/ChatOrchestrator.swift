@@ -1,13 +1,14 @@
 import Foundation
 import CoreGraphics
 
-/// Chat layer: raw text → embedding search.
+/// Chat layer: free text (+ optional date chip) → embedding search.
 @MainActor
 final class ChatOrchestrator {
     let session = ChatSession()
 
     func handle(
         _ userText: String,
+        date: DatePhrase.Match? = nil,
         library: PhotoLibraryService,
         history: [ChatMessage] = []
     ) async -> AssistantReply {
@@ -43,12 +44,17 @@ final class ChatOrchestrator {
             return AssistantReply(text: "Photos access is off. Allow Photos in Settings.", photoIDs: [], title: "")
         }
 
-        let intent = PhotoIntent.semanticOnly(text)
-        let result = await library.photosForQuery(text)
+        let displaySemantic: String = {
+            if let date, !text.isEmpty { return "\(date.label) · \(text)" }
+            if let date { return date.label }
+            return text
+        }()
+        let intent = PhotoIntent.semanticOnly(displaySemantic)
+        let result = await library.photosForQuery(text, date: date)
 
         session.append(
             ChatTurn(
-                userText: text,
+                userText: displaySemantic,
                 intent: intent,
                 resultIDs: result.photos.map(\.localIdentifier)
             )

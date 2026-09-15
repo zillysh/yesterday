@@ -98,7 +98,13 @@ struct ChatView: View {
                     .padding(.horizontal)
             }
 
-            ComposerBar(text: $chat.draft, enabled: !chat.isSending) {
+            ComposerBar(
+                text: $chat.draft,
+                dateChips: chat.dateChips,
+                onRemoveChip: { chat.removeDateChip($0) },
+                onDraftChange: { chat.tokenizeDraftDates() },
+                enabled: !chat.isSending
+            ) {
                 Task { await chat.send() }
             }
         }

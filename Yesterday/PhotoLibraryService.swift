@@ -311,6 +311,26 @@ final class PhotoLibraryService: @unchecked Sendable {
         return Array(groups)
     }
 
+    /// Time-gap clusters across recent Camera Roll — building blocks for the Moments tab.
+    func recentLibraryClusters(dayCount: Int = 60, scanLimit: Int = 1_200, minPhotos: Int = 3) -> [PhotoEvent] {
+        let end = Date().addingTimeInterval(60)
+        let start = Calendar.current.date(
+            byAdding: .day,
+            value: -dayCount,
+            to: Calendar.current.startOfDay(for: Date())
+        )
+        let raw = search(
+            start: start,
+            end: end,
+            favoritesOnly: false,
+            albumName: nil,
+            limit: scanLimit
+        )
+        return clusterEvents(raw)
+            .filter { $0.photos.count >= minPhotos }
+            .sorted { ($0.photos.compactMap(\.createdAt).max() ?? .distantPast) > ($1.photos.compactMap(\.createdAt).max() ?? .distantPast) }
+    }
+
     func beginTurn() {
         previewIDs = []
         previewTitle = ""
