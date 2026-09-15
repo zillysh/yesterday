@@ -1,17 +1,22 @@
 import Foundation
 import Observation
+import SwiftUI
 
 /// Chat data: messages, sending, save to the Post album.
 
 struct SearchChoice: Identifiable, Equatable, Sendable {
     let id: UUID
     let label: String
+    /// Ready-made set, or empty when `query` should run a new search.
     let photoIDs: [String]
+    /// If set, tapping this runs the search again with this text.
+    var query: String?
 
-    init(id: UUID = UUID(), label: String, photoIDs: [String]) {
+    init(id: UUID = UUID(), label: String, photoIDs: [String] = [], query: String? = nil) {
         self.id = id
         self.label = label
         self.photoIDs = photoIDs
+        self.query = query
     }
 }
 
@@ -94,6 +99,7 @@ struct ChatMessage: Identifiable, Equatable {
 final class ChatViewModel {
     var messages: [ChatMessage] = []
     var draft = ""
+    var dateChips: [DateChip] = []
     var isSending = false
     var saveError: String?
 
@@ -101,24 +107,77 @@ final class ChatViewModel {
 
     var modelNote: String { engine.modelNote }
 
+    var canSend: Bool {
+        !isSending && (
+            !draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !dateChips.isEmpty
+        )
+    }
+
+    /// Promote a finished date phrase into a pill (space after date, or on send).
+    func tokenizeDraftDates(force: Bool = false) {
+        guard dateChips.isEmpty else { return }
+        // Prefer exact phrases while typing; detector only on send.
+        guard let match = DatePhrase.extract(from: draft, allowDetector: force),
+              DatePhrase.isCompleteForChip(match, in: draft, force: force)
+        else { return }
+
+        var next = draft
+        if let range = next.range(of: match.matchedText, options: .caseInsensitive) {
+            next.removeSubrange(range)
+        }
+        next = next
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        withAnimation(.easeOut(duration: 0.15)) {
+            dateChips = [DateChip(match: match)]
+            draft = next
+        }
+    }
+
+    func removeDateChip(_ id: UUID) {
+        dateChips.removeAll { $0.id == id }
+    }
+
     func sendPreset(_ text: String) async {
         draft = text
+        dateChips = []
+        tokenizeDraftDates(force: true)
         await send()
     }
 
     func send() async {
-        let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isSending else { return }
+        tokenizeDraftDates(force: true)
+        let visual = draft.trimmingCharacters(in: .whitespacesAndNewlines)
+        let chip = dateChips.first
+        guard canSend else { return }
+
+        let display: String = {
+            switch (chip?.label, visual.isEmpty) {
+            case (let label?, false): return "\(label) · \(visual)"
+            case (let label?, true): return label
+            default: return visual
+            }
+        }()
+
         draft = ""
-        messages.append(.user(text))
+        let chipsSnapshot = dateChips
+        dateChips = []
+        messages.append(.user(display))
         isSending = true
         defer { isSending = false }
 
-        if isEditingCurrentSet(text), let kept = messages.last(where: { $0.role == .assistant && !$0.photoIDs.isEmpty }) {
+        if isEditingCurrentSet(visual.isEmpty ? display : visual),
+           let kept = messages.last(where: { $0.role == .assistant && !$0.photoIDs.isEmpty })
+        {
             PhotoLibraryService.shared.lastResultIDs = Array(kept.selectedIDs)
         }
 
-        let reply = await engine.reply(to: text, history: messages)
+        let reply = await engine.reply(
+            to: visual,
+            date: chipsSnapshot.first?.match,
+            history: messages
+        )
         messages.append(.assistant(reply))
     }
 
@@ -137,7 +196,13 @@ final class ChatViewModel {
     }
 
     func pickChoice(_ choice: SearchChoice) {
-        guard !isSending, !choice.photoIDs.isEmpty else { return }
+        guard !isSending else { return }
+        if let query = choice.query, !query.isEmpty {
+            draft = query
+            Task { await send() }
+            return
+        }
+        guard !choice.photoIDs.isEmpty else { return }
         messages.append(.user(choice.label))
         let moment = Moment(
             title: choice.label,

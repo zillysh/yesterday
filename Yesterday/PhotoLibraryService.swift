@@ -46,7 +46,6 @@ final class PhotoLibraryService: @unchecked Sendable {
     var postAlbumIDs: [String] = []
     var albums: [AlbumSummary] = []
     var peopleAlbums: [AlbumSummary] = []
-    var homePin: (latitude: Double, longitude: Double)?
     var visibleImageCount: Int = 0
     var lastResultIDs: [String] = []
     var previewIDs: [String] = []
@@ -55,9 +54,12 @@ final class PhotoLibraryService: @unchecked Sendable {
     private var producedResultsThisTurn = false
 
     private let imageManager = PHCachingImageManager()
+    private let thumbCache = NSCache<NSString, UIImage>()
 
     private init() {
         authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        thumbCache.countLimit = 400
+        thumbCache.totalCostLimit = 80 * 1024 * 1024
     }
 
     var isLimited: Bool { authorization == .limited }
@@ -76,9 +78,7 @@ final class PhotoLibraryService: @unchecked Sendable {
         peopleAlbums = fetchPeopleAlbums()
         postAlbumIDs = fetchPostAlbumIDs()
         visibleImageCount = PHAsset.fetchAssets(with: .image, options: nil).count
-        if homePin == nil {
-            homePin = estimateHomePin()
-        }
+        PhotoEmbeddingIndex.shared.startIfNeeded(library: self)
     }
 
     func search(
@@ -148,142 +148,12 @@ final class PhotoLibraryService: @unchecked Sendable {
         fetch.enumerateObjects { asset, _, stop in
             scanned += 1
             if asset.mediaType != .image { return }
-            if asset.mediaSubtypes.contains(.photoScreenshot) { return }
             if locatedOnly, asset.location == nil { return }
             photos.append(Self.summary(for: asset))
             if photos.count >= limit || scanned >= scanCap { stop.pointee = true }
         }
         lastResultIDs = photos.map(\.localIdentifier)
         producedResultsThisTurn = true
-        return photos
-    }
-
-    /// Walks Camera Roll for shots actually near a pin, not just the newest GPS photos.
-    func photosNear(
-        latitude: Double,
-        longitude: Double,
-        radius: CLLocationDistance,
-        start: Date?,
-        end: Date?,
-        favoritesOnly: Bool,
-        limit: Int,
-        scanCap: Int = 80_000
-    ) -> [PhotoSummary] {
-        let target = CLLocation(latitude: latitude, longitude: longitude)
-        let options = PHFetchOptions()
-        options.includeHiddenAssets = false
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        options.predicate = imagePredicate(start: start, end: end, favoritesOnly: favoritesOnly)
-
-        let fetch: PHFetchResult<PHAsset>
-        if let recents = cameraRoll() {
-            fetch = PHAsset.fetchAssets(in: recents, options: options)
-        } else {
-            fetch = PHAsset.fetchAssets(with: .image, options: options)
-        }
-
-        var photos: [PhotoSummary] = []
-        var scanned = 0
-        fetch.enumerateObjects { asset, _, stop in
-            scanned += 1
-            if asset.mediaType != .image { return }
-            if asset.mediaSubtypes.contains(.photoScreenshot) { return }
-            guard let location = asset.location, location.distance(from: target) <= radius else { return }
-            photos.append(Self.summary(for: asset))
-            if photos.count >= limit || scanned >= scanCap { stop.pointee = true }
-        }
-        lastResultIDs = photos.map(\.localIdentifier)
-        producedResultsThisTurn = true
-        return photos
-    }
-
-    func photosInRegion(
-        latitude: Double,
-        longitude: Double,
-        latitudeDelta: Double,
-        longitudeDelta: Double,
-        start: Date?,
-        end: Date?,
-        favoritesOnly: Bool,
-        limit: Int,
-        scanCap: Int = 200_000
-    ) -> [PhotoSummary] {
-        let latMin = latitude - latitudeDelta / 2
-        let latMax = latitude + latitudeDelta / 2
-        let lonMin = longitude - longitudeDelta / 2
-        let lonMax = longitude + longitudeDelta / 2
-        let options = PHFetchOptions()
-        options.includeHiddenAssets = false
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        options.predicate = imagePredicate(start: start, end: end, favoritesOnly: favoritesOnly)
-
-        let fetch: PHFetchResult<PHAsset>
-        if let recents = cameraRoll() {
-            fetch = PHAsset.fetchAssets(in: recents, options: options)
-        } else {
-            fetch = PHAsset.fetchAssets(with: .image, options: options)
-        }
-
-        var photos: [PhotoSummary] = []
-        var scanned = 0
-        fetch.enumerateObjects { asset, _, stop in
-            scanned += 1
-            if asset.mediaType != .image { return }
-            if asset.mediaSubtypes.contains(.photoScreenshot) { return }
-            guard let location = asset.location else { return }
-            let lat = location.coordinate.latitude
-            let lon = location.coordinate.longitude
-            guard lat >= latMin, lat <= latMax, lon >= lonMin, lon <= lonMax else { return }
-            photos.append(Self.summary(for: asset))
-            if photos.count >= limit || scanned >= scanCap { stop.pointee = true }
-        }
-        lastResultIDs = photos.map(\.localIdentifier)
-        producedResultsThisTurn = true
-        return photos
-    }
-
-    func placeName(latitude: Double, longitude: Double) async -> String {
-        let key = "\(Int((latitude * 20).rounded())):\(Int((longitude * 20).rounded()))"
-        if let cached = Self.placeNameCache[key] { return cached }
-        do {
-            let marks = try await CLGeocoder().reverseGeocodeLocation(
-                CLLocation(latitude: latitude, longitude: longitude)
-            )
-            let mark = marks.first
-            let name = mark?.locality
-                ?? mark?.subAdministrativeArea
-                ?? mark?.administrativeArea
-                ?? mark?.country
-                ?? "There"
-            Self.placeNameCache[key] = name
-            return name
-        } catch {
-            return "There"
-        }
-    }
-
-    private static var placeNameCache: [String: String] = [:]
-
-    /// Camera Roll shots that actually have a GPS pin, not just the newest 200 photos.
-    func locatedPhotos(limit: Int = 220, scanCap: Int = 2500) -> [PhotoSummary] {
-        let options = PHFetchOptions()
-        options.includeHiddenAssets = false
-        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        guard let recents = cameraRoll() else { return [] }
-        let fetch = PHAsset.fetchAssets(in: recents, options: options)
-        var photos: [PhotoSummary] = []
-        var scanned = 0
-        fetch.enumerateObjects { asset, _, stop in
-            scanned += 1
-            if asset.mediaType != .image { return }
-            if asset.mediaSubtypes.contains(.photoScreenshot) { return }
-            guard asset.location != nil else {
-                if scanned >= scanCap { stop.pointee = true }
-                return
-            }
-            photos.append(Self.summary(for: asset))
-            if photos.count >= limit || scanned >= scanCap { stop.pointee = true }
-        }
         return photos
     }
 
@@ -441,6 +311,26 @@ final class PhotoLibraryService: @unchecked Sendable {
         return Array(groups)
     }
 
+    /// Time-gap clusters across recent Camera Roll — building blocks for the Moments tab.
+    func recentLibraryClusters(dayCount: Int = 60, scanLimit: Int = 1_200, minPhotos: Int = 3) -> [PhotoEvent] {
+        let end = Date().addingTimeInterval(60)
+        let start = Calendar.current.date(
+            byAdding: .day,
+            value: -dayCount,
+            to: Calendar.current.startOfDay(for: Date())
+        )
+        let raw = search(
+            start: start,
+            end: end,
+            favoritesOnly: false,
+            albumName: nil,
+            limit: scanLimit
+        )
+        return clusterEvents(raw)
+            .filter { $0.photos.count >= minPhotos }
+            .sorted { ($0.photos.compactMap(\.createdAt).max() ?? .distantPast) > ($1.photos.compactMap(\.createdAt).max() ?? .distantPast) }
+    }
+
     func beginTurn() {
         previewIDs = []
         previewTitle = ""
@@ -564,32 +454,88 @@ final class PhotoLibraryService: @unchecked Sendable {
     }
 
     func requestThumbnail(for id: String, size: CGSize) async -> UIImage? {
-        await requestImage(for: id, size: size, fit: .aspectFill, sharp: true)
+        await requestImage(for: id, size: size, fit: .aspectFill, quality: .grid)
+    }
+
+    /// Fast opportunistic thumb for embedding index (not UI display).
+    func requestFastThumbnail(for id: String, size: CGSize) async -> UIImage? {
+        await requestImage(for: id, size: size, fit: .aspectFill, quality: .fast)
     }
 
     func requestDisplayImage(for id: String, size: CGSize) async -> UIImage? {
-        await requestImage(for: id, size: size, fit: .aspectFit, sharp: true)
+        await requestImage(for: id, size: size, fit: .aspectFit, quality: .full)
+    }
+
+    func startCachingThumbnails(ids: [String], size: CGSize) {
+        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+        var assets: [PHAsset] = []
+        fetch.enumerateObjects { asset, _, _ in assets.append(asset) }
+        guard !assets.isEmpty else { return }
+        let scale = UIScreen.main.scale
+        let pixels = CGSize(width: max(size.width, 1) * scale, height: max(size.height, 1) * scale)
+        let options = PHImageRequestOptions()
+        options.deliveryMode = .highQualityFormat
+        options.resizeMode = .fast
+        options.isNetworkAccessAllowed = true
+        imageManager.startCachingImages(
+            for: assets,
+            targetSize: pixels,
+            contentMode: .aspectFill,
+            options: options
+        )
+    }
+
+    private enum ThumbQuality {
+        case fast, grid, full
     }
 
     private func requestImage(
         for id: String,
         size: CGSize,
         fit: PHImageContentMode,
-        sharp: Bool
+        quality: ThumbQuality
     ) async -> UIImage? {
+        let cacheKey = "\(id)|\(Int(size.width))x\(Int(size.height))|\(quality)|\(fit.rawValue)" as NSString
+        if quality != .full, let cached = thumbCache.object(forKey: cacheKey) {
+            return cached
+        }
+
         let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
         guard let asset = fetch.firstObject else { return nil }
+
         let options = PHImageRequestOptions()
-        options.deliveryMode = sharp ? .highQualityFormat : .opportunistic
-        options.resizeMode = sharp ? .exact : .fast
         options.version = .current
-        options.isNetworkAccessAllowed = true
         options.isSynchronous = false
+        options.isNetworkAccessAllowed = true
+        switch quality {
+        case .fast:
+            options.deliveryMode = .fastFormat
+            options.resizeMode = .fast
+        case .grid:
+            // Wait for a real grid-sized decode — fastFormat looks blurry forever.
+            options.deliveryMode = .highQualityFormat
+            options.resizeMode = .fast
+        case .full:
+            options.deliveryMode = .highQualityFormat
+            options.resizeMode = .exact
+        }
+
         let scale = UIScreen.main.scale
-        let pixels = CGSize(width: max(size.width, 1) * scale, height: max(size.height, 1) * scale)
-        return await withCheckedContinuation { continuation in
+        let maxPointEdge: CGFloat
+        switch quality {
+        case .fast: maxPointEdge = 180
+        case .grid: maxPointEdge = 320
+        case .full: maxPointEdge = 1600
+        }
+        let capped = CGSize(
+            width: min(max(size.width, 1), maxPointEdge),
+            height: min(max(size.height, 1), maxPointEdge)
+        )
+        let pixels = CGSize(width: capped.width * scale, height: capped.height * scale)
+
+        let image: UIImage? = await withCheckedContinuation { continuation in
             var finished = false
-            PHImageManager.default().requestImage(
+            imageManager.requestImage(
                 for: asset,
                 targetSize: pixels,
                 contentMode: fit,
@@ -602,26 +548,32 @@ final class PhotoLibraryService: @unchecked Sendable {
                     return
                 }
                 let degraded = (info?[PHImageResultIsDegradedKey] as? Bool) == true
-                if sharp {
+                switch quality {
+                case .fast:
+                    // First usable frame is fine for indexing.
+                    if let image {
+                        guard !finished else { return }
+                        finished = true
+                        continuation.resume(returning: image)
+                    } else if !degraded {
+                        guard !finished else { return }
+                        finished = true
+                        continuation.resume(returning: nil)
+                    }
+                case .grid, .full:
                     if degraded { return }
                     guard !finished else { return }
                     finished = true
                     continuation.resume(returning: image)
-                    return
-                }
-                if let image {
-                    guard !finished else { return }
-                    finished = true
-                    continuation.resume(returning: image)
-                    return
-                }
-                if !degraded {
-                    guard !finished else { return }
-                    finished = true
-                    continuation.resume(returning: nil)
                 }
             }
         }
+
+        if let image, quality != .full {
+            let cost = Int(image.size.width * image.size.height * 4)
+            thumbCache.setObject(image, forKey: cacheKey, cost: cost)
+        }
+        return image
     }
 
     func classify(ids: [String]) async -> String {
@@ -678,34 +630,6 @@ final class PhotoLibraryService: @unchecked Sendable {
             }
         }
         return rows.sorted { $0.count > $1.count }
-    }
-
-    private func estimateHomePin() -> (latitude: Double, longitude: Double)? {
-        let samples = locatedPhotos(limit: 400, scanCap: 2500)
-        var buckets: [String: (count: Int, lat: Double, lon: Double)] = [:]
-        for photo in samples {
-            guard let lat = photo.latitude, let lon = photo.longitude else { continue }
-            let key = "\(Int((lat * 80).rounded())):\(Int((lon * 80).rounded()))"
-            if var bucket = buckets[key] {
-                bucket.count += 1
-                bucket.lat += lat
-                bucket.lon += lon
-                buckets[key] = bucket
-            } else {
-                buckets[key] = (1, lat, lon)
-            }
-        }
-        guard let best = buckets.values.max(by: { $0.count < $1.count }), best.count >= 8 else {
-            return nil
-        }
-        return (best.lat / Double(best.count), best.lon / Double(best.count))
-    }
-
-    func distanceMeters(from photo: PhotoSummary, latitude: Double, longitude: Double) -> CLLocationDistance? {
-        guard let lat = photo.latitude, let lon = photo.longitude else { return nil }
-        let here = CLLocation(latitude: lat, longitude: lon)
-        let there = CLLocation(latitude: latitude, longitude: longitude)
-        return here.distance(from: there)
     }
 
     private func fetchAlbums() -> [AlbumSummary] {

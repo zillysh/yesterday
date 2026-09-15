@@ -33,59 +33,82 @@ struct SuggestionChipRow: View {
 
 struct ComposerBar: View {
     @Binding var text: String
+    var dateChips: [DateChip]
+    var onRemoveChip: (UUID) -> Void
+    var onDraftChange: () -> Void
     var enabled: Bool
     var onSend: () -> Void
     @State private var promptIndex = 0
 
     private let prompts = [
-        "Trip to DC",
+        "7th aug dog",
+        "Last weekend beach",
+        "june 2025",
         "Yesterday",
-        "Dinner last Saturday",
         "Golden hour",
         "Cute home pics",
-        "Last weekend",
-        "Someone you named in Photos",
     ]
 
     var body: some View {
-        HStack(spacing: 10) {
-            ZStack(alignment: .leading) {
-                if text.isEmpty {
-                    Text(prompts[promptIndex])
-                        .foregroundStyle(.white.opacity(0.32))
-                        .transition(.asymmetric(
-                            insertion: .offset(y: 8).combined(with: .opacity),
-                            removal: .offset(y: -8).combined(with: .opacity)
-                        ))
-                        .id(promptIndex)
-                        .allowsHitTesting(false)
-                }
-                TextField("", text: $text, axis: .vertical)
-                    .textFieldStyle(.plain)
-                    .foregroundStyle(.white)
-                    .lineLimit(1...4)
-                    .submitLabel(.send)
-                    .onSubmit {
-                        if canSend { onSend() }
+        VStack(alignment: .leading, spacing: 8) {
+            if !dateChips.isEmpty {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 8) {
+                        ForEach(dateChips) { chip in
+                            dateChipView(chip)
+                        }
                     }
+                }
+                .padding(.horizontal, 2)
             }
-            .clipped()
 
-            Button(action: onSend) {
-                Image(systemName: "arrow.up.circle.fill")
-                    .font(.system(size: 28))
-                    .foregroundStyle(canSend ? .white : .white.opacity(0.28))
+            HStack(spacing: 10) {
+                ZStack(alignment: .leading) {
+                    if text.isEmpty && dateChips.isEmpty {
+                        Text(prompts[promptIndex])
+                            .foregroundStyle(.white.opacity(0.32))
+                            .transition(.asymmetric(
+                                insertion: .offset(y: 8).combined(with: .opacity),
+                                removal: .offset(y: -8).combined(with: .opacity)
+                            ))
+                            .id(promptIndex)
+                            .allowsHitTesting(false)
+                    } else if text.isEmpty, !dateChips.isEmpty {
+                        Text("Add what you see — dog, beach…")
+                            .foregroundStyle(.white.opacity(0.32))
+                            .allowsHitTesting(false)
+                    }
+                    TextField("", text: $text, axis: .vertical)
+                        .textFieldStyle(.plain)
+                        .foregroundStyle(.white)
+                        .lineLimit(1...4)
+                        .submitLabel(.send)
+                        .onChange(of: text) { _, _ in
+                            onDraftChange()
+                        }
+                        .onSubmit {
+                            if canSend { onSend() }
+                        }
+                }
+                .clipped()
+
+                Button(action: onSend) {
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.system(size: 28))
+                        .foregroundStyle(canSend ? .white : .white.opacity(0.28))
+                }
+                .disabled(!canSend)
             }
-            .disabled(!canSend)
         }
         .padding(.leading, 16)
         .padding(.trailing, 8)
-        .padding(.vertical, 8)
-        .background(MessageTheme.composer, in: Capsule())
+        .padding(.vertical, 10)
+        .background(MessageTheme.composer, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(MessageTheme.background)
         .animation(.easeInOut(duration: 0.4), value: promptIndex)
+        .animation(.easeOut(duration: 0.18), value: dateChips.map(\.id))
         .task {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2.6))
@@ -98,8 +121,32 @@ struct ComposerBar: View {
         }
     }
 
+    private func dateChipView(_ chip: DateChip) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "calendar")
+                .font(.caption.weight(.semibold))
+            Text(chip.label)
+                .font(.subheadline.weight(.medium))
+            Button {
+                onRemoveChip(chip.id)
+            } label: {
+                Image(systemName: "xmark")
+                    .font(.caption2.weight(.bold))
+                    .foregroundStyle(.white.opacity(0.55))
+            }
+            .buttonStyle(.plain)
+        }
+        .foregroundStyle(.white)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.14), in: Capsule())
+    }
+
     private var canSend: Bool {
-        enabled && !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        enabled && (
+            !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                || !dateChips.isEmpty
+        )
     }
 }
 
@@ -111,7 +158,7 @@ struct PermissionView: View {
             Text("Yesterday needs your library")
                 .font(.title2.weight(.semibold))
                 .foregroundStyle(.white)
-            Text("Ask for what you remember — a person you’ve named in Photos, a city, dinner, home — then pick a set for Post.")
+            Text("Ask for what you remember — a day, a weekend, dog, beach — then pick a set for Post.")
                 .font(.body)
                 .foregroundStyle(.white.opacity(0.55))
                 .multilineTextAlignment(.center)

@@ -9,6 +9,10 @@ struct RootView: View {
                 .tabItem {
                     Label("Chat", systemImage: "bubble.left")
                 }
+            MomentsView()
+                .tabItem {
+                    Label("Moments", systemImage: "sparkles.rectangle.stack")
+                }
             PostsView()
                 .tabItem {
                     Label("Posts", systemImage: "square.stack")
