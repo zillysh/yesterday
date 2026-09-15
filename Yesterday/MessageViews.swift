@@ -116,7 +116,7 @@ struct PhotoFan: View {
         ZStack {
             ForEach(Array(shown.enumerated()), id: \.element) { index, id in
                 let offset = fanOffset(index: index, count: shown.count)
-                AssetThumbnail(id: id, targetSize: CGSize(width: 512, height: 512))
+                AssetThumbnail(id: id, targetSize: CGSize(width: 220, height: 220))
                     .frame(width: 168, height: 168)
                     .clipShape(RoundedRectangle(cornerRadius: 22, style: .continuous))
                     .overlay {
@@ -198,6 +198,12 @@ struct AlbumPickerView: View {
             .padding(.horizontal, 20)
             .padding(.top, 20)
             .padding(.bottom, 16)
+            .onAppear {
+                PhotoLibraryService.shared.startCachingThumbnails(
+                    ids: Array(photoIDs.prefix(90)),
+                    size: CGSize(width: 200, height: 200)
+                )
+            }
 
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 14) {
@@ -229,7 +235,7 @@ struct AlbumPickerView: View {
                                 Button {
                                     lookingAt = PhotoPeek(id: id, groupIDs: groupIDs(containing: id))
                                 } label: {
-                                    AssetThumbnail(id: id, targetSize: CGSize(width: 180, height: 180))
+                                    AssetThumbnail(id: id, targetSize: CGSize(width: 220, height: 220))
                                         .frame(width: 64, height: 64)
                                         .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
                                 }
@@ -340,14 +346,14 @@ struct AlbumPickerView: View {
             } label: {
                 Group {
                     if let size {
-                        AssetThumbnail(id: id, targetSize: CGSize(width: 280, height: 280))
+                        AssetThumbnail(id: id, targetSize: CGSize(width: 220, height: 220))
                             .frame(width: size, height: size)
                             .clipped()
                     } else {
                         Color.clear
                             .aspectRatio(1, contentMode: .fit)
                             .overlay {
-                                AssetThumbnail(id: id, targetSize: CGSize(width: 280, height: 280))
+                                AssetThumbnail(id: id, targetSize: CGSize(width: 220, height: 220))
                             }
                     }
                 }
@@ -603,7 +609,7 @@ private struct ZoomablePhoto: View {
             }
         }
         .task(id: "\(id)-\(isActive)") {
-            image = await PhotoLibraryService.shared.requestThumbnail(
+            image = await PhotoLibraryService.shared.requestFastThumbnail(
                 for: id,
                 size: CGSize(width: 360, height: 360)
             )
@@ -720,12 +726,18 @@ struct AssetThumbnail: View {
                 }
             }
         }
-        .task(id: id) {
+        .task(id: "\(id)-\(Int(targetSize.width))") {
             dateLabel = PhotoLibraryService.shared.dateLabel(for: id)
-            image = await PhotoLibraryService.shared.requestThumbnail(
-                for: id,
-                size: targetSize
-            )
+            // Quick preview, then upgrade to grid-sharp so it doesn't stay blurry.
+            if image == nil {
+                image = await PhotoLibraryService.shared.requestFastThumbnail(
+                    for: id,
+                    size: CGSize(width: min(targetSize.width, 120), height: min(targetSize.height, 120))
+                )
+            }
+            if let sharp = await PhotoLibraryService.shared.requestThumbnail(for: id, size: targetSize) {
+                image = sharp
+            }
         }
     }
 }

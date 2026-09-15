@@ -4,3 +4,5 @@ xcuserdata/
 *.xcuserstate
 DerivedData/
 build/
+vendor/
+Yesterday/Models/.cache/

@@ -1,7 +1,19 @@
 import Foundation
 import FoundationModels
 
-/// Turns what you type into a photo search. Dates go straight to Photos.
+/// Turns what you type into an embedding photo search.
+
+enum PhotoFormatting {
+    static func isoDate(_ raw: String?) -> Date? {
+        guard let raw, !raw.isEmpty else { return nil }
+        let iso = ISO8601DateFormatter()
+        iso.formatOptions = [.withFullDate, .withDashSeparatorInDate]
+        if let date = iso.date(from: String(raw.prefix(10))) {
+            return Calendar.current.startOfDay(for: date)
+        }
+        return ISO8601DateFormatter().date(from: raw)
+    }
+}
 
 struct AssistantReply: Sendable {
     let text: String
@@ -13,6 +25,8 @@ struct AssistantReply: Sendable {
 
 @MainActor
 final class AssistantEngine {
+    private let orchestrator = ChatOrchestrator()
+
     var modelNote: String {
         switch SystemLanguageModel.default.availability {
         case .available:
@@ -29,118 +43,9 @@ final class AssistantEngine {
     }
 
     func reply(to userText: String, history: [ChatMessage] = []) async -> AssistantReply {
-        _ = history
-        await PhotoLibraryService.shared.refresh()
-        PhotoLibraryService.shared.beginTurn()
-        return await HeuristicAssistant.reply(to: userText)
-    }
-}
-
-enum HeuristicAssistant {
-    @MainActor
-    static func reply(to userText: String) async -> AssistantReply {
-        let text = userText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let lower = text.lowercased()
-        let library = PhotoLibraryService.shared
-
-        if looksLikeSave(lower) {
-            let ids = library.lastResultIDs
-            if ids.isEmpty {
-                return AssistantReply(text: "Pick a set first — try Recents, yesterday, or type what you’re looking for.", photoIDs: [], title: "")
-            }
-            return AssistantReply(
-                text: "These \(ids.count) stay selected. Open the stack and save the ones you want to Post.",
-                photoIDs: ids,
-                title: "Post"
-            )
-        }
-
-        if looksLikeAccess(lower) {
-            if library.isLimited {
-                return AssistantReply(
-                    text: "Not fully — Photos is on Limited. Tap More Photos and choose Keep All Photos so trips and places can show up.",
-                    photoIDs: [],
-                    title: ""
-                )
-            }
-            if library.canRead {
-                return AssistantReply(
-                    text: "Yes — full Camera Roll access. Type a trip, a person from Photos, or a day.",
-                    photoIDs: [],
-                    title: ""
-                )
-            }
-            return AssistantReply(text: "Photos access is off. Allow Photos in Settings.", photoIDs: [], title: "")
-        }
-
-        if looksLikeListAlbums(lower) {
-            return AssistantReply(text: library.listAlbumsText(), photoIDs: [], title: "")
-        }
-
-        let result = await library.photosForQuery(text)
-        return photosReply(
-            result.photos,
-            asked: result.asked,
-            extra: result.note,
-            choices: result.choices
-        )
-    }
-
-    @MainActor
-    private static func photosReply(
-        _ photos: [PhotoSummary],
-        asked: String,
-        extra: String? = nil,
-        choices: [SearchChoice] = []
-    ) -> AssistantReply {
-        if !choices.isEmpty {
-            return AssistantReply(
-                text: extra ?? "Which one?",
-                photoIDs: [],
-                title: asked,
-                moments: [],
-                choices: choices
-            )
-        }
-        _ = PhotoLibraryService.shared.preview(ids: photos.map(\.localIdentifier), title: asked)
-        let preview = PhotoLibraryService.shared.consumePreview()
-        if photos.isEmpty {
-            let message = extra ?? PhotoLibraryService.shared.accessNote() ?? "If Photos access is limited, tap More Photos."
-            let text = extra == nil
-                ? "Nothing for \(asked) in Camera Roll. \(message)"
-                : extra ?? message
-            return AssistantReply(text: text, photoIDs: [], title: asked)
-        }
-        var text = "Hey, here are \(photos.count) photos from \(asked)."
-        if let extra, !extra.isEmpty {
-            text = extra
-        }
-        if let note = PhotoLibraryService.shared.accessNote() {
-            text += "\n\(note)"
-        }
-        let ids = preview.ids
-        let moment = Moment(
-            title: asked,
-            subtitle: "\(ids.count) photos",
-            photoIDs: ids,
-            selectedIDs: []
-        )
-        return AssistantReply(text: text, photoIDs: ids, title: asked, moments: ids.isEmpty ? [] : [moment])
-    }
-
-    private static func looksLikeSave(_ lower: String) -> Bool {
-        lower.contains("save") || lower.contains("add to post") || lower.contains("put in post")
-            || lower.contains("that's the set") || lower.contains("thats the set")
-            || lower.contains("use these")
-    }
-
-    private static func looksLikeListAlbums(_ lower: String) -> Bool {
-        lower.contains("album") && (lower.contains("list") || lower.contains("what") || lower.contains("show"))
-    }
-
-    private static func looksLikeAccess(_ lower: String) -> Bool {
-        (lower.contains("access") || lower.contains("permission"))
-            && (lower.contains("photo") || lower.contains("full") || lower.contains("library"))
+        // Do not refresh the whole library on every message — that blocked search
+        // and raced the embedding index. ChatView already refreshes on appear.
+        return await orchestrator.handle(userText, library: .shared, history: history)
     }
 }
 
@@ -159,7 +64,7 @@ enum DayPart {
 }
 
 enum DatePhrase {
-    static func range(in text: String) -> (start: Date, end: Date, label: String)? {
+    static func range(in text: String, usingDetector: Bool = true) -> (start: Date, end: Date, label: String)? {
         let lower = text.lowercased()
         let calendar = Calendar.current
         let today = calendar.startOfDay(for: Date())
@@ -195,6 +100,16 @@ enum DatePhrase {
             let lastMonth = calendar.date(byAdding: .month, value: -1, to: thisMonth)!
             return (lastMonth, thisMonth, "last month")
         }
+        if lower.contains("this month") {
+            let comps = calendar.dateComponents([.year, .month], from: today)
+            let thisMonth = calendar.date(from: comps)!
+            let next = calendar.date(byAdding: .month, value: 1, to: thisMonth)!
+            return (thisMonth, next, "this month")
+        }
+
+        if let monthYear = monthYearRange(in: lower, today: today) {
+            return monthYear
+        }
 
         let names: [(Int, String)] = [
             (1, "sunday"), (2, "monday"), (3, "tuesday"), (4, "wednesday"),
@@ -208,7 +123,10 @@ enum DatePhrase {
             return sliceDay(day, part: DayPart.parse(lower), label: PhotoFormatting.shortDay.string(from: day))
         }
 
-        return detectedRange(in: text, today: today)
+        if usingDetector {
+            return detectedRange(in: text, today: today)
+        }
+        return nil
     }
 
     private static func namedWeekday(
@@ -275,6 +193,59 @@ enum DatePhrase {
         }
     }
 
+    private static func monthYearRange(
+        in lower: String,
+        today: Date
+    ) -> (start: Date, end: Date, label: String)? {
+        let months: [(String, Int)] = [
+            ("january", 1), ("jan", 1),
+            ("february", 2), ("feb", 2),
+            ("march", 3), ("mar", 3),
+            ("april", 4), ("apr", 4),
+            ("may", 5),
+            ("june", 6), ("jun", 6),
+            ("july", 7), ("jul", 7),
+            ("august", 8), ("aug", 8),
+            ("september", 9), ("sept", 9), ("sep", 9),
+            ("october", 10), ("oct", 10),
+            ("november", 11), ("nov", 11),
+            ("december", 12), ("dec", 12),
+        ]
+        let calendar = Calendar.current
+        let currentYear = calendar.component(.year, from: today)
+
+        // "june 2025" / "jun 2025"
+        for (name, month) in months {
+            let pattern = #"\b\#(name)\s+(\d{4})\b"#
+            if let match = lower.range(of: pattern, options: .regularExpression) {
+                let chunk = String(lower[match])
+                let yearStr = chunk.split(whereSeparator: { !$0.isNumber }).first.map(String.init)
+                guard let yearStr, let year = Int(yearStr),
+                      let start = calendar.date(from: DateComponents(year: year, month: month, day: 1)),
+                      let end = calendar.date(byAdding: .month, value: 1, to: start)
+                else { continue }
+                let label = DateFormatter.monthYear.string(from: start)
+                return (start, end, label)
+            }
+        }
+
+        // Bare "june" / "in june" → most recent occurrence of that month (not future)
+        for (name, month) in months {
+            let pattern = #"\b\#(name)\b"#
+            guard lower.range(of: pattern, options: .regularExpression) != nil else { continue }
+            var year = currentYear
+            var start = calendar.date(from: DateComponents(year: year, month: month, day: 1))!
+            if start > today {
+                year -= 1
+                start = calendar.date(from: DateComponents(year: year, month: month, day: 1))!
+            }
+            let end = calendar.date(byAdding: .month, value: 1, to: start)!
+            let label = DateFormatter.monthYear.string(from: start)
+            return (start, end, label)
+        }
+        return nil
+    }
+
     private static func weekStart(for day: Date) -> Date {
         var calendar = Calendar.current
         calendar.firstWeekday = 1
@@ -334,6 +305,12 @@ extension DateFormatter {
     static let tripDay: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "MMM d, yyyy"
+        return formatter
+    }()
+
+    static let monthYear: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "MMMM yyyy"
         return formatter
     }()
 }

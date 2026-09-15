@@ -6,12 +6,16 @@ import Observation
 struct SearchChoice: Identifiable, Equatable, Sendable {
     let id: UUID
     let label: String
+    /// Ready-made set, or empty when `query` should run a new search.
     let photoIDs: [String]
+    /// If set, tapping this runs the search again with this text.
+    var query: String?
 
-    init(id: UUID = UUID(), label: String, photoIDs: [String]) {
+    init(id: UUID = UUID(), label: String, photoIDs: [String] = [], query: String? = nil) {
         self.id = id
         self.label = label
         self.photoIDs = photoIDs
+        self.query = query
     }
 }
 
@@ -137,7 +141,13 @@ final class ChatViewModel {
     }
 
     func pickChoice(_ choice: SearchChoice) {
-        guard !isSending, !choice.photoIDs.isEmpty else { return }
+        guard !isSending else { return }
+        if let query = choice.query, !query.isEmpty {
+            draft = query
+            Task { await send() }
+            return
+        }
+        guard !choice.photoIDs.isEmpty else { return }
         messages.append(.user(choice.label))
         let moment = Moment(
             title: choice.label,
