@@ -1,22 +1,20 @@
 import SwiftUI
 
 struct RootView: View {
-    @Environment(PhotoLibraryService.self) private var library
+    @State private var tab = 0
 
     var body: some View {
-        TabView {
-            ChatView()
-                .tabItem {
-                    Label("Chat", systemImage: "bubble.left")
-                }
-            MomentsView()
+        TabView(selection: $tab) {
+            MomentsView(isSelected: tab == 0)
                 .tabItem {
                     Label("Moments", systemImage: "sparkles.rectangle.stack")
                 }
-            PostsView()
+                .tag(0)
+            RecapsView()
                 .tabItem {
-                    Label("Posts", systemImage: "square.stack")
+                    Label("Recaps", systemImage: "rectangle.stack")
                 }
+                .tag(1)
         }
         .tint(.white)
         .preferredColorScheme(.dark)

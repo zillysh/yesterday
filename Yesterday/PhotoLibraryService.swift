@@ -51,7 +51,10 @@ final class PhotoLibraryService: @unchecked Sendable {
     var previewIDs: [String] = []
     var previewTitle: String = ""
     var labelCache: [String: [String]] = [:]
+    /// Bumps whenever Photos reports a library change — Moments / chat can refresh.
+    var libraryRevision: Int = 0
     private var producedResultsThisTurn = false
+    private let changeBridge = PhotoLibraryChangeBridge()
 
     private let imageManager = PHCachingImageManager()
     private let thumbCache = NSCache<NSString, UIImage>()
@@ -60,6 +63,12 @@ final class PhotoLibraryService: @unchecked Sendable {
         authorization = PHPhotoLibrary.authorizationStatus(for: .readWrite)
         thumbCache.countLimit = 400
         thumbCache.totalCostLimit = 80 * 1024 * 1024
+        changeBridge.onChange = { [weak self] in
+            Task { @MainActor in
+                self?.libraryRevision &+= 1
+            }
+        }
+        PHPhotoLibrary.shared().register(changeBridge)
     }
 
     var isLimited: Bool { authorization == .limited }
@@ -79,6 +88,18 @@ final class PhotoLibraryService: @unchecked Sendable {
         postAlbumIDs = fetchPostAlbumIDs()
         visibleImageCount = PHAsset.fetchAssets(with: .image, options: nil).count
         PhotoEmbeddingIndex.shared.startIfNeeded(library: self)
+    }
+
+    /// Fast path for cold launch — paint Chat first, warm library/index in the background.
+    func refreshForLaunch() async {
+        guard canRead else { return }
+        visibleImageCount = PHAsset.fetchAssets(with: .image, options: nil).count
+        Task(priority: .utility) { @MainActor in
+            albums = fetchAlbums()
+            peopleAlbums = fetchPeopleAlbums()
+            postAlbumIDs = fetchPostAlbumIDs()
+            PhotoEmbeddingIndex.shared.startIfNeeded(library: self)
+        }
     }
 
     func search(
@@ -266,7 +287,7 @@ final class PhotoLibraryService: @unchecked Sendable {
 
     /// Morning, afternoon, and night are separate. A night can run past midnight.
     private func shouldStartNewMoment(from previous: Date?, to current: Date?) -> Bool {
-        guard let previous, let current else { return false }
+         guard let previous, let current else { return false }
         if current.timeIntervalSince(previous) > 3 * 3600 { return true }
         let before = DaySlice.of(previous)
         let after = DaySlice.of(current)
@@ -314,10 +335,13 @@ final class PhotoLibraryService: @unchecked Sendable {
     /// Time-gap clusters across recent Camera Roll — building blocks for the Moments tab.
     func recentLibraryClusters(dayCount: Int = 60, scanLimit: Int = 1_200, minPhotos: Int = 3) -> [PhotoEvent] {
         let end = Date().addingTimeInterval(60)
-        let start = Calendar.current.date(
+        let calendar = Calendar.current
+        let today = calendar.startOfDay(for: Date())
+        let recentCutoff = calendar.date(byAdding: .day, value: -2, to: today) ?? today
+        let start = calendar.date(
             byAdding: .day,
             value: -dayCount,
-            to: Calendar.current.startOfDay(for: Date())
+            to: today
         )
         let raw = search(
             start: start,
@@ -327,8 +351,36 @@ final class PhotoLibraryService: @unchecked Sendable {
             limit: scanLimit
         )
         return clusterEvents(raw)
-            .filter { $0.photos.count >= minPhotos }
+            .filter { event in
+                let newest = event.photos.compactMap(\.createdAt).max() ?? event.eventDay
+                // Keep thin “today / yesterday” bursts so Moments stays current.
+                let threshold = newest >= recentCutoff ? 1 : minPhotos
+                return event.photos.count >= threshold
+            }
             .sorted { ($0.photos.compactMap(\.createdAt).max() ?? .distantPast) > ($1.photos.compactMap(\.createdAt).max() ?? .distantPast) }
+    }
+
+    /// Cheap fingerprint so Moments can skip rebuilds when nothing changed.
+    func momentsContentStamp(dayCount: Int = 75) -> String {
+        let calendar = Calendar.current
+        let dayKey = calendar.startOfDay(for: Date()).timeIntervalSince1970
+        let end = Date().addingTimeInterval(60)
+        let start = calendar.date(byAdding: .day, value: -dayCount, to: calendar.startOfDay(for: Date()))
+
+        let options = PHFetchOptions()
+        options.includeHiddenAssets = false
+        options.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+        options.predicate = imagePredicate(start: start, end: end, favoritesOnly: false)
+
+        let fetch: PHFetchResult<PHAsset>
+        if let recents = cameraRoll() {
+            fetch = PHAsset.fetchAssets(in: recents, options: options)
+        } else {
+            fetch = PHAsset.fetchAssets(with: .image, options: options)
+        }
+
+        let newest = fetch.firstObject?.localIdentifier ?? "none"
+        return "\(dayKey)|\(newest)|\(fetch.count)|\(libraryRevision)"
     }
 
     func beginTurn() {
@@ -672,6 +724,12 @@ final class PhotoLibraryService: @unchecked Sendable {
         return DateFormatter.shortStamp.string(from: date)
     }
 
+    func viewerCaption(for id: String) -> String {
+        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
+        guard let date = fetch.firstObject?.creationDate else { return "" }
+        return DateFormatter.viewerCaption.string(from: date)
+    }
+
     func accessNote() -> String? {
         guard isLimited else { return nil }
         return "I can only see \(visibleImageCount) photo\(visibleImageCount == 1 ? "" : "s") you allowed — tap More Photos and choose Keep All Photos for the real camera roll."
@@ -767,6 +825,17 @@ enum DaySlice {
     }
 }
 
+/// Forwards Photos library mutations onto the main actor via `libraryRevision`.
+private final class PhotoLibraryChangeBridge: NSObject, PHPhotoLibraryChangeObserver {
+    var onChange: (() -> Void)?
+
+    func photoLibraryDidChange(_ changeInstance: PHChange) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onChange?()
+        }
+    }
+}
+
 enum PhotoLibraryError: LocalizedError {
     case couldNotCreateAlbum
 
@@ -798,6 +867,13 @@ private extension DateFormatter {
     static let dayClock: DateFormatter = {
         let formatter = DateFormatter()
         formatter.dateFormat = "EEE h:mma"
+        return formatter
+    }()
+
+    static let viewerCaption: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
         return formatter
     }()
 }
