@@ -35,7 +35,7 @@ struct ChatView: View {
             .toolbarBackground(.visible, for: .navigationBar)
             .task {
                 if library.canRead {
-                    await library.refresh()
+                    await library.refreshForLaunch()
                 }
             }
             .background {

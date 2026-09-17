@@ -33,7 +33,7 @@ final class PhotoEmbeddingIndex {
     func startIfNeeded(library: PhotoLibraryService) {
         guard !started else { return }
         started = true
-        indexTask = Task(priority: .userInitiated) {
+        indexTask = Task(priority: .utility) {
             await bootstrap(library: library)
         }
     }
@@ -234,6 +234,10 @@ final class PhotoEmbeddingIndex {
             if batch % 10 == 0 {
                 await PhotoVectorStore.shared.saveIfNeeded()
                 await Task.yield()
+            }
+            // Keep scroll/chat responsive while the library indexes.
+            if batch % 25 == 0 {
+                try? await Task.sleep(nanoseconds: 15_000_000)
             }
         }
 

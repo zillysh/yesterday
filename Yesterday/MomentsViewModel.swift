@@ -7,20 +7,76 @@ struct LibraryMoment: Identifiable, Equatable, Sendable {
     var title: String
     var subtitle: String
     var photoIDs: [String]
+    /// Photo shown in the week highlight rail — swappable from the rest of the set.
+    var coverID: String
     var sortDate: Date
+    var dayLabel: String
+    /// Stable key so cover swaps survive refresh.
+    var clusterKey: String
 
     init(
-        id: UUID = UUID(),
+        id: UUID? = nil,
         title: String,
         subtitle: String,
         photoIDs: [String],
-        sortDate: Date
+        coverID: String? = nil,
+        sortDate: Date,
+        dayLabel: String = "",
+        clusterKey: String = ""
     ) {
-        self.id = id
+        let key = clusterKey.isEmpty ? Self.makeClusterKey(photoIDs) : clusterKey
+        self.id = id ?? Self.stableID(for: key)
         self.title = title
         self.subtitle = subtitle
         self.photoIDs = photoIDs
+        self.coverID = coverID ?? photoIDs.first ?? ""
         self.sortDate = sortDate
+        self.dayLabel = dayLabel
+        self.clusterKey = key
+    }
+
+    static func makeClusterKey(_ photoIDs: [String]) -> String {
+        photoIDs.sorted().joined(separator: "|")
+    }
+
+    static func stableID(for key: String) -> UUID {
+        var hash: UInt64 = 5381
+        for byte in key.utf8 {
+            hash = ((hash << 5) &+ hash) &+ UInt64(byte)
+        }
+        // Build a deterministic UUID from the hash (not random each refresh).
+        let bytes = withUnsafeBytes(of: hash.bigEndian) { Data($0) }
+        var uuid = uuid_t(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        for (index, byte) in bytes.enumerated() where index < 8 {
+            withUnsafeMutableBytes(of: &uuid) { raw in
+                raw[index] = byte
+                raw[index + 8] = byte &+ UInt8(index)
+            }
+        }
+        return UUID(uuid: uuid)
+    }
+}
+
+/// A week frame — the highlight rail is the story.
+struct MomentWeek: Identifiable, Equatable, Sendable {
+    let id: UUID
+    var title: String
+    var dateRange: String
+    var weekStart: Date
+    var moments: [LibraryMoment]
+
+    init(
+        id: UUID? = nil,
+        title: String,
+        dateRange: String,
+        weekStart: Date,
+        moments: [LibraryMoment]
+    ) {
+        self.id = id ?? LibraryMoment.stableID(for: "week:\(weekStart.timeIntervalSince1970)")
+        self.title = title
+        self.dateRange = dateRange
+        self.weekStart = weekStart
+        self.moments = moments
     }
 }
 
@@ -28,47 +84,102 @@ struct LibraryMoment: Identifiable, Equatable, Sendable {
 @MainActor
 @Observable
 final class MomentsViewModel {
-    var moments: [LibraryMoment] = []
+    var weeks: [MomentWeek] = []
     var isLoading = false
     var note: String?
+    /// Quiet status under the gathering card.
+    var gatherStatus: String = "Pulling from your library"
+    /// A few random recent photos for the gathering preview (picked once).
+    var gatherPreviewIDs: [String] = []
+    /// Coarse 0…1 — updated sparingly so UI doesn’t thrash indexing.
+    var gatherProgress: Double = 0
 
-    private var loaded = false
+    private var lastStamp: String?
+    private var refreshGeneration = 0
+    /// False when we painted without a usable embedding index — allow one silent rebuild.
+    private var finalizedWithEmbeddings = false
 
     func loadIfNeeded(library: PhotoLibraryService) async {
-        guard !loaded, !isLoading else { return }
-        await refresh(library: library)
+        await refreshIfNeeded(library: library)
+    }
+
+    func refreshIfNeeded(library: PhotoLibraryService, force: Bool = false) async {
+        PhotoEmbeddingIndex.shared.startIfNeeded(library: library)
+        let stamp = library.momentsContentStamp()
+        let indexReady = PhotoEmbeddingIndex.shared.indexedCount >= 8
+
+        if !force, stamp == lastStamp {
+            // First open timed out before embeddings — rebuild under loading (no in-place morph).
+            if !finalizedWithEmbeddings, indexReady, !weeks.isEmpty {
+                weeks = []
+                await refresh(library: library, stamp: stamp)
+            }
+            return
+        }
+        await refresh(library: library, stamp: stamp)
     }
 
     func refresh(library: PhotoLibraryService) async {
-        isLoading = true
-        defer { isLoading = false }
+        PhotoEmbeddingIndex.shared.startIfNeeded(library: library)
+        await refresh(library: library, stamp: library.momentsContentStamp())
+    }
 
-        let clusters = library.recentLibraryClusters(dayCount: 75, scanLimit: 1_400, minPhotos: 3)
+    private func refresh(library: PhotoLibraryService, stamp: String) async {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        isLoading = true
+        gatherProgress = 0.08
+        gatherStatus = "Pulling from your library"
+        defer {
+            if generation == refreshGeneration {
+                isLoading = false
+                gatherProgress = 1
+            }
+        }
+
+        let clusters = library.recentLibraryClusters(dayCount: 90, scanLimit: 1_200, minPhotos: 2)
+        guard generation == refreshGeneration else { return }
+
+        // A couple random recent shots — not a slideshow of the whole library.
+        let pool = clusters.flatMap { $0.photos.map(\.localIdentifier) }
+        gatherPreviewIDs = Array(Set(pool).shuffled().prefix(5))
+        gatherProgress = 0.2
+
         guard !clusters.isEmpty else {
-            moments = []
+            weeks = []
             note = "Not enough recent photos to build moments yet."
-            loaded = true
+            lastStamp = stamp
+            finalizedWithEmbeddings = true
+            gatherStatus = "Nothing recent enough"
             return
         }
 
-        var built: [LibraryMoment] = []
-        built.reserveCapacity(min(clusters.count, 40))
-        var placeSources: [[PhotoSummary]] = []
-        placeSources.reserveCapacity(min(clusters.count, 40))
+        // Wait for embeddings before building titles — never morph after first paint.
+        gatherStatus = "Reading your photos"
+        await waitForEmbeddings(generation: generation)
+        guard generation == refreshGeneration else { return }
+        let hadEmbeddings = PhotoEmbeddingIndex.shared.indexedCount >= 8
+        gatherProgress = 0.55
+        gatherStatus = "Finding moments"
 
-        for event in clusters.prefix(40) {
+        // Don't let this week's volume starve older weeks off the feed.
+        let events = Self.balancedEvents(clusters, maxWeeks: 12, maxPerWeek: 6)
+        var built: [LibraryMoment] = []
+        built.reserveCapacity(events.count)
+        var placeSources: [[PhotoSummary]] = []
+
+        for (offset, event) in events.enumerated() {
+            guard generation == refreshGeneration else { return }
             let ids = event.photos.map(\.localIdentifier)
             let sortDate = event.photos.compactMap(\.createdAt).max() ?? event.eventDay
             let timeTitle = Self.timeTitle(for: event)
+            // Activity first when we have a vibe; when is always supporting context.
             var title = timeTitle
             var subtitle = "\(ids.count) photos · \(Self.dateLine(for: event))"
-            var skipPlace = false
 
-            if let vibe = await Self.vibeTitle(for: ids) {
-                // “Dinner at Mala” / “Film photos” on top of the time framing.
+            if hadEmbeddings, offset < 24, let vibe = await Self.vibeTitle(for: ids) {
                 title = vibe
                 subtitle = "\(timeTitle) · \(ids.count) photos"
-                skipPlace = vibe == "Screenshots"
             }
 
             built.append(
@@ -76,44 +187,308 @@ final class MomentsViewModel {
                     title: title,
                     subtitle: subtitle,
                     photoIDs: ids,
-                    sortDate: sortDate
+                    coverID: HighlightCoverStore.cover(for: ids) ?? ids.first,
+                    sortDate: sortDate,
+                    dayLabel: Self.dayLabel(for: sortDate)
                 )
             )
-            placeSources.append(skipPlace ? [] : event.photos)
+            placeSources.append(event.photos)
         }
 
-        // Show the recap immediately, then weave in places as geocodes land.
-        moments = Self.coalesce(built)
-        note = nil
-        loaded = true
-        isLoading = false
+        guard generation == refreshGeneration else { return }
+        gatherProgress = 0.85
+        var finalized = Self.coalesce(built)
 
-        let placed = await Self.titlesWithPlaces(moments, sources: placeSources)
-        if placed != moments.map(\.title) {
-            for i in moments.indices {
-                moments[i].title = placed[i]
+        let placed = await Self.titlesWithPlaces(
+            finalized,
+            sources: Array(placeSources.prefix(10))
+        )
+        guard generation == refreshGeneration else { return }
+        for i in finalized.indices {
+            finalized[i].title = placed[i]
+        }
+
+        // Single assignment — titles are final when the feed appears.
+        let visible = finalized.filter { !DismissedMomentsStore.isDismissed($0.clusterKey) }
+        weeks = Self.mergeManualMoments(into: Self.weeks(from: visible))
+        note = weeks.isEmpty ? "No moments yet." : nil
+        lastStamp = stamp
+        finalizedWithEmbeddings = hadEmbeddings
+        gatherProgress = 1
+        gatherStatus = "Ready"
+    }
+
+    private func waitForEmbeddings(generation: Int) async {
+        _ = await PhotoEmbeddingIndex.shared.ensureReady(minCount: 1)
+        // Cap wait (~8s) so gathering never hangs forever.
+        for _ in 0..<24 {
+            guard generation == refreshGeneration else { return }
+            if PhotoEmbeddingIndex.shared.indexedCount >= 8 { return }
+            try? await Task.sleep(nanoseconds: 350_000_000)
+        }
+    }
+
+    // MARK: - Weeks
+
+    /// Spread moments across weeks so a busy recent stretch doesn’t hide older weeks.
+    private static func balancedEvents(
+        _ clusters: [PhotoLibraryService.PhotoEvent],
+        maxWeeks: Int,
+        maxPerWeek: Int
+    ) -> [PhotoLibraryService.PhotoEvent] {
+        var calendar = Calendar.current
+        calendar.firstWeekday = 1
+
+        var byWeek: [Date: [PhotoLibraryService.PhotoEvent]] = [:]
+        for event in clusters {
+            let date = event.photos.compactMap(\.createdAt).max() ?? event.eventDay
+            let start = weekStart(for: date, calendar: calendar)
+            byWeek[start, default: []].append(event)
+        }
+
+        let weekStarts = byWeek.keys.sorted(by: >).prefix(maxWeeks)
+        var picked: [PhotoLibraryService.PhotoEvent] = []
+        picked.reserveCapacity(maxWeeks * maxPerWeek)
+        for start in weekStarts {
+            let weekEvents = byWeek[start] ?? []
+            picked.append(contentsOf: weekEvents.prefix(maxPerWeek))
+        }
+        return picked.sorted {
+            ($0.photos.compactMap(\.createdAt).max() ?? .distantPast)
+                > ($1.photos.compactMap(\.createdAt).max() ?? .distantPast)
+        }
+    }
+
+    func setCover(photoIDs: [String], photoID: String) {
+        guard photoIDs.contains(photoID) else { return }
+        HighlightCoverStore.setCover(photoID, for: photoIDs)
+        let key = LibraryMoment.makeClusterKey(photoIDs)
+        var next = weeks
+        var changed = false
+        for weekIndex in next.indices {
+            for momentIndex in next[weekIndex].moments.indices {
+                let moment = next[weekIndex].moments[momentIndex]
+                if moment.clusterKey == key || moment.photoIDs == photoIDs {
+                    next[weekIndex].moments[momentIndex].coverID = photoID
+                    changed = true
+                }
             }
         }
+        if changed {
+            weeks = next
+        }
+    }
+
+    func deleteMoment(_ moment: LibraryMoment) {
+        DismissedMomentsStore.dismiss(moment.clusterKey)
+        ManualMomentsStore.remove(clusterKey: moment.clusterKey)
+        let next = weeks.compactMap { week -> MomentWeek? in
+            let kept = week.moments.filter { $0.id != moment.id && $0.clusterKey != moment.clusterKey }
+            guard !kept.isEmpty else { return nil }
+            var copy = week
+            copy.moments = kept
+            return copy
+        }
+        weeks = next
+        if weeks.isEmpty {
+            note = "No moments yet."
+        }
+    }
+
+    /// Add a hand-picked moment into a week frame (from Curate & share).
+    @discardableResult
+    func addMoment(photoIDs: [String], to weekStart: Date) async -> LibraryMoment? {
+        let ids = photoIDs.reduce(into: [String]()) { result, id in
+            guard !id.isEmpty, !result.contains(id) else { return }
+            result.append(id)
+        }
+        guard !ids.isEmpty else { return nil }
+
+        let summaries = PhotoLibraryService.shared.summaries(for: ids)
+        let sortDate = summaries.compactMap(\.createdAt).max()
+            ?? Calendar.current.startOfDay(for: weekStart)
+        let day = Self.dayLabel(for: sortDate)
+        let title = await Self.vibeTitle(for: ids) ?? (day.isEmpty ? "Moment" : day)
+        let cover = ids[0]
+        let moment = LibraryMoment(
+            title: title,
+            subtitle: "\(ids.count) photos",
+            photoIDs: ids,
+            coverID: cover,
+            sortDate: sortDate,
+            dayLabel: day
+        )
+
+        var calendar = Calendar.current
+        calendar.firstWeekday = 1
+        let start = Self.weekStart(for: weekStart, calendar: calendar)
+
+        ManualMomentsStore.add(
+            ManualMomentRecord(
+                weekStart: start.timeIntervalSince1970,
+                photoIDs: ids,
+                coverID: cover,
+                title: title,
+                sortDate: sortDate.timeIntervalSince1970
+            )
+        )
+
+        var next = weeks
+        if let index = next.firstIndex(where: { Calendar.current.isDate($0.weekStart, inSameDayAs: start) }) {
+            // Avoid dupes if the same set is already there.
+            if next[index].moments.contains(where: { $0.clusterKey == moment.clusterKey }) {
+                return next[index].moments.first { $0.clusterKey == moment.clusterKey }
+            }
+            next[index].moments.insert(moment, at: 0)
+        } else {
+            next.insert(
+                MomentWeek(
+                    title: Self.weekTitle(for: start, calendar: calendar),
+                    dateRange: Self.weekDateRange(for: start, calendar: calendar),
+                    weekStart: start,
+                    moments: [moment]
+                ),
+                at: 0
+            )
+        }
+        weeks = next
+        note = nil
+        return moment
+    }
+
+    func moment(id: UUID) -> LibraryMoment? {
+        for week in weeks {
+            if let moment = week.moments.first(where: { $0.id == id }) {
+                return moment
+            }
+        }
+        return nil
+    }
+
+    private static func weeks(from moments: [LibraryMoment]) -> [MomentWeek] {
+        var calendar = Calendar.current
+        calendar.firstWeekday = 1 // Sunday-start weeks
+
+        var buckets: [Date: [LibraryMoment]] = [:]
+        for moment in moments {
+            let start = weekStart(for: moment.sortDate, calendar: calendar)
+            buckets[start, default: []].append(moment)
+        }
+
+        return buckets.keys.sorted(by: >).compactMap { start in
+            let ordered = (buckets[start] ?? []).sorted { $0.sortDate > $1.sortDate }
+            guard !ordered.isEmpty else { return nil }
+            return MomentWeek(
+                title: weekTitle(for: start, calendar: calendar),
+                dateRange: weekDateRange(for: start, calendar: calendar),
+                weekStart: start,
+                moments: ordered
+            )
+        }
+    }
+
+    private static func mergeManualMoments(into weeks: [MomentWeek]) -> [MomentWeek] {
+        let records = ManualMomentsStore.all()
+        guard !records.isEmpty else { return weeks }
+
+        var calendar = Calendar.current
+        calendar.firstWeekday = 1
+        var next = weeks
+
+        for record in records {
+            let start = Date(timeIntervalSince1970: record.weekStart)
+            let ids = record.photoIDs.filter { !$0.isEmpty }
+            guard !ids.isEmpty else { continue }
+            let key = LibraryMoment.makeClusterKey(ids)
+            if DismissedMomentsStore.isDismissed(key) { continue }
+
+            let sortDate = Date(timeIntervalSince1970: record.sortDate)
+            let moment = LibraryMoment(
+                title: record.title,
+                subtitle: "\(ids.count) photos",
+                photoIDs: ids,
+                coverID: ids.contains(record.coverID) ? record.coverID : ids[0],
+                sortDate: sortDate,
+                dayLabel: dayLabel(for: sortDate),
+                clusterKey: key
+            )
+
+            if let index = next.firstIndex(where: { Calendar.current.isDate($0.weekStart, inSameDayAs: start) }) {
+                if next[index].moments.contains(where: { $0.clusterKey == key }) { continue }
+                next[index].moments.insert(moment, at: 0)
+            } else {
+                next.append(
+                    MomentWeek(
+                        title: weekTitle(for: start, calendar: calendar),
+                        dateRange: weekDateRange(for: start, calendar: calendar),
+                        weekStart: calendar.startOfDay(for: start),
+                        moments: [moment]
+                    )
+                )
+            }
+        }
+
+        return next.sorted { $0.weekStart > $1.weekStart }
+    }
+
+    private static func weekStart(for date: Date, calendar: Calendar) -> Date {
+        let day = calendar.startOfDay(for: date)
+        let weekday = calendar.component(.weekday, from: day)
+        let delta = (weekday - calendar.firstWeekday + 7) % 7
+        return calendar.date(byAdding: .day, value: -delta, to: day) ?? day
+    }
+
+    private static func weekTitle(for start: Date, calendar: Calendar) -> String {
+        let today = calendar.startOfDay(for: Date())
+        let thisWeek = weekStart(for: today, calendar: calendar)
+        if start == thisWeek { return "This week" }
+        if let last = calendar.date(byAdding: .day, value: -7, to: thisWeek), start == last {
+            return "Last week"
+        }
+        return weekDateRange(for: start, calendar: calendar)
+    }
+
+    private static func weekDateRange(for start: Date, calendar: Calendar) -> String {
+        let end = calendar.date(byAdding: .day, value: 6, to: start) ?? start
+        let a = DateFormatter.chipDayNoYear.string(from: start)
+        let b = DateFormatter.chipDayNoYear.string(from: end)
+        return "\(a)–\(b)"
+    }
+
+    private static func dayLabel(for date: Date) -> String {
+        DateFormatter.weekdayShort.string(from: date)
+    }
+
+    private static func isPureTimeTitle(_ title: String) -> Bool {
+        let t = title.lowercased()
+        let exact: Set<String> = [
+            "today", "yesterday", "tonight", "this morning", "this afternoon",
+            "this weekend", "last weekend", "yesterday morning",
+            "this weekend · morning", "this weekend · night",
+        ]
+        if exact.contains(t) { return true }
+        let weekdays = ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+        for day in weekdays {
+            if t == day || t == "\(day) morning" || t == "\(day) night" { return true }
+        }
+        if t.contains(" at ") || t.contains(" in ") { return false }
+        return false
     }
 
     private static func titlesWithPlaces(_ moments: [LibraryMoment], sources: [[PhotoSummary]]) async -> [String] {
         var placeByPhoto = [String: MomentPlace]()
-        await withTaskGroup(of: ([String], MomentPlace)?.self) { group in
-            for photos in sources where !photos.isEmpty {
-                group.addTask {
-                    guard let place = await placeLabel(for: photos) else { return nil }
-                    return (photos.map(\.localIdentifier), place)
-                }
-            }
-            for await hit in group {
-                guard let hit else { continue }
-                for id in hit.0 {
-                    placeByPhoto[id] = hit.1
-                }
+        // Cap MapKit work so gathering can't hang on a stuck geocode.
+        let deadline = Date().addingTimeInterval(6)
+        for photos in sources where !photos.isEmpty {
+            if Date() > deadline { break }
+            guard let place = await placeLabel(for: photos) else { continue }
+            for id in photos.map(\.localIdentifier) {
+                placeByPhoto[id] = place
             }
         }
 
         return moments.map { moment in
+            if moment.title == "Screenshots" { return moment.title }
             guard let place = moment.photoIDs.lazy.compactMap({ placeByPhoto[$0] }).first else {
                 return moment.title
             }
@@ -260,42 +635,59 @@ final class MomentsViewModel {
     }
 
     /// Probe MobileCLIP for a short vibe label when the index is warm.
+    private static var vibeVectors: [(label: String, vector: [Float])]?
+
+    private static let vibeQueries: [(label: String, query: String)] = [
+        ("Dinner", "dinner at a restaurant"),
+        ("Brunch", "brunch food"),
+        ("Coffee", "coffee shop"),
+        ("Drinks", "drinks at a bar"),
+        ("Beach", "beach"),
+        ("Park", "park outdoors"),
+        ("Party", "party with friends"),
+        ("Concert", "concert"),
+        ("Film photos", "film photograph"),
+        ("Portraits", "portrait of a person"),
+        ("Dogs", "dog"),
+        ("Travel", "travel vacation trip"),
+        ("City night", "city at night"),
+        ("Golden hour", "golden hour sunset"),
+        ("Home", "home interior cozy"),
+        ("Screenshots", "phone screenshot"),
+    ]
+
+    private static func vibeCatalog() async -> [(label: String, vector: [Float])] {
+        if let vibeVectors { return vibeVectors }
+        var built: [(label: String, vector: [Float])] = []
+        built.reserveCapacity(vibeQueries.count)
+        for vibe in vibeQueries {
+            if let vector = await PhotoEmbedder.shared.embedText(vibe.query) {
+                built.append((vibe.label, vector))
+            }
+        }
+        vibeVectors = built
+        return built
+    }
+
     private static func vibeTitle(for ids: [String]) async -> String? {
         let index = PhotoEmbeddingIndex.shared
-        guard index.indexedCount > 20 else { return nil }
+        guard index.indexedCount >= 8 else { return nil }
 
-        let sample = Array(ids.prefix(8))
-        let vibes: [(label: String, query: String)] = [
-            ("Dinner", "dinner at a restaurant"),
-            ("Brunch", "brunch food"),
-            ("Coffee", "coffee shop"),
-            ("Drinks", "drinks at a bar"),
-            ("Beach", "beach"),
-            ("Park", "park outdoors"),
-            ("Party", "party with friends"),
-            ("Concert", "concert"),
-            ("Film photos", "film photograph"),
-            ("Portraits", "portrait of a person"),
-            ("Dogs", "dog"),
-            ("Travel", "travel vacation trip"),
-            ("City night", "city at night"),
-            ("Golden hour", "golden hour sunset"),
-            ("Home", "home interior cozy"),
-            ("Screenshots", "phone screenshot"),
-        ]
+        let catalog = await vibeCatalog()
+        guard !catalog.isEmpty else { return nil }
 
+        let sample = Array(ids.prefix(6))
         var best: (String, Float)?
-        for vibe in vibes {
-            let hits = await index.rank(ids: sample, text: vibe.query, minScore: 0.16)
+        for vibe in catalog {
+            let hits = await PhotoVectorStore.shared.rank(ids: sample, query: vibe.vector, minScore: 0.14)
             guard !hits.isEmpty else { continue }
             let avg = hits.prefix(4).map(\.score).reduce(0, +) / Float(min(4, hits.count))
             if best == nil || avg > best!.1 {
                 best = (vibe.label, avg)
             }
         }
-        guard let best, best.1 >= 0.22 else { return nil }
-        // Screenshots only if clearly dominant.
-        if best.0 == "Screenshots", best.1 < 0.28 { return nil }
+        guard let best, best.1 >= 0.20 else { return nil }
+        if best.0 == "Screenshots", best.1 < 0.26 { return nil }
         return best.0
     }
 
@@ -308,6 +700,11 @@ final class MomentsViewModel {
             if sameTitle, close, current.photoIDs.count + next.photoIDs.count <= 80 {
                 let merged = current.photoIDs + next.photoIDs
                 current.photoIDs = merged
+                current.clusterKey = LibraryMoment.makeClusterKey(merged)
+                current.coverID = HighlightCoverStore.cover(for: merged) ?? current.coverID
+                if !merged.contains(current.coverID) {
+                    current.coverID = merged.first ?? current.coverID
+                }
                 // Keep the time framing in subtitle when present.
                 if current.subtitle.contains("·") {
                     let timePart = current.subtitle.split(separator: "·").first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? current.title
@@ -322,6 +719,114 @@ final class MomentsViewModel {
         }
         out.append(current)
         return out
+    }
+}
+
+// MARK: - Highlight cover persistence
+
+enum HighlightCoverStore {
+    private static let defaultsKey = "moments.highlightCovers"
+
+    static func cover(for photoIDs: [String]) -> String? {
+        let key = LibraryMoment.makeClusterKey(photoIDs)
+        guard let map = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: String] else {
+            return nil
+        }
+        guard let cover = map[storageKey(for: key)], photoIDs.contains(cover) else { return nil }
+        return cover
+    }
+
+    static func setCover(_ photoID: String, for photoIDs: [String]) {
+        let key = LibraryMoment.makeClusterKey(photoIDs)
+        var map = (UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: String]) ?? [:]
+        map[storageKey(for: key)] = photoID
+        // Cap growth — keep newest 200 overrides.
+        if map.count > 200 {
+            map = Dictionary(uniqueKeysWithValues: map.suffix(200))
+        }
+        UserDefaults.standard.set(map, forKey: defaultsKey)
+    }
+
+    private static func storageKey(for clusterKey: String) -> String {
+        // Short stable fingerprint so UserDefaults keys stay small.
+        var hash: UInt64 = 5381
+        for byte in clusterKey.utf8 {
+            hash = ((hash << 5) &+ hash) &+ UInt64(byte)
+        }
+        return String(hash, radix: 16)
+    }
+}
+
+// MARK: - Manual moments (added during curate)
+
+struct ManualMomentRecord: Codable, Equatable, Sendable {
+    var weekStart: TimeInterval
+    var photoIDs: [String]
+    var coverID: String
+    var title: String
+    var sortDate: TimeInterval
+}
+
+enum ManualMomentsStore {
+    private static let defaultsKey = "moments.manualMoments"
+
+    static func all() -> [ManualMomentRecord] {
+        guard let data = UserDefaults.standard.data(forKey: defaultsKey),
+              let decoded = try? JSONDecoder().decode([ManualMomentRecord].self, from: data)
+        else { return [] }
+        return decoded
+    }
+
+    static func add(_ record: ManualMomentRecord) {
+        var records = all()
+        let key = LibraryMoment.makeClusterKey(record.photoIDs)
+        records.removeAll { LibraryMoment.makeClusterKey($0.photoIDs) == key }
+        records.insert(record, at: 0)
+        if records.count > 80 {
+            records = Array(records.prefix(80))
+        }
+        save(records)
+    }
+
+    static func remove(clusterKey: String) {
+        var records = all()
+        records.removeAll { LibraryMoment.makeClusterKey($0.photoIDs) == clusterKey }
+        save(records)
+    }
+
+    private static func save(_ records: [ManualMomentRecord]) {
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        UserDefaults.standard.set(data, forKey: defaultsKey)
+    }
+}
+
+enum DismissedMomentsStore {
+    private static let defaultsKey = "moments.dismissedClusters"
+
+    static func isDismissed(_ clusterKey: String) -> Bool {
+        dismissedKeys().contains(storageKey(for: clusterKey))
+    }
+
+    static func dismiss(_ clusterKey: String) {
+        var keys = dismissedKeys()
+        keys.insert(storageKey(for: clusterKey))
+        // Cap growth.
+        if keys.count > 400 {
+            keys = Set(keys.suffix(400))
+        }
+        UserDefaults.standard.set(Array(keys), forKey: defaultsKey)
+    }
+
+    private static func dismissedKeys() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: defaultsKey) ?? [])
+    }
+
+    private static func storageKey(for clusterKey: String) -> String {
+        var hash: UInt64 = 5381
+        for byte in clusterKey.utf8 {
+            hash = ((hash << 5) &+ hash) &+ UInt64(byte)
+        }
+        return String(hash, radix: 16)
     }
 }
 
