@@ -10,6 +10,8 @@ struct MomentsView: View {
     @State private var lookingAt: PhotoPeek?
     @State private var editing: HighlightEditSession?
     @State private var editingCoverID = ""
+    @State private var captionMoment: LibraryMoment?
+    @State private var captionDraft = ""
 
     private var isGathering: Bool {
         library.canRead && model.isLoading && model.weeks.isEmpty
@@ -74,6 +76,26 @@ struct MomentsView: View {
                     model.setCover(photoIDs: session.photoIDs, photoID: newCover)
                 }
             }
+            .alert(
+                "Edit caption",
+                isPresented: Binding(
+                    get: { captionMoment != nil },
+                    set: { if !$0 { captionMoment = nil } }
+                )
+            ) {
+                TextField("Caption", text: $captionDraft)
+                Button("Save") {
+                    if let moment = captionMoment {
+                        model.setTitle(captionDraft, for: moment)
+                    }
+                    captionMoment = nil
+                }
+                Button("Cancel", role: .cancel) {
+                    captionMoment = nil
+                }
+            } message: {
+                Text("Shown on the moment and in shared recaps.")
+            }
         }
     }
 
@@ -111,6 +133,10 @@ struct MomentsView: View {
                                     onEditCover: { moment in
                                         editingCoverID = moment.coverID
                                         editing = HighlightEditSession(moment: moment)
+                                    },
+                                    onEditCaption: { moment in
+                                        captionDraft = moment.title
+                                        captionMoment = moment
                                     },
                                     onDelete: { moment in
                                         withAnimation(.easeOut(duration: 0.2)) {
@@ -269,6 +295,7 @@ private struct MomentWeekRailView: View {
     var onLook: (PhotoPeek) -> Void
     var onSetHighlight: (LibraryMoment, String) -> Void
     var onEditCover: (LibraryMoment) -> Void
+    var onEditCaption: (LibraryMoment) -> Void
     var onDelete: (LibraryMoment) -> Void
 
     var body: some View {
@@ -313,8 +340,9 @@ private struct MomentWeekRailView: View {
                             onLook: onLook,
                             onSetHighlight: { onSetHighlight(moment, $0) },
                             onEditCover: { onEditCover(moment) },
+                            onEditCaption: { onEditCaption(moment) },
                             onDelete: { onDelete(moment) },
-                            onOpenRecap: { onOpenRecap(moment.coverID) }
+                            onOpenRecap: { photoID in onOpenRecap(photoID) }
                         )
                         .containerRelativeFrame(.horizontal) { length, _ in
                             length * 0.82
@@ -330,36 +358,36 @@ private struct MomentWeekRailView: View {
     }
 }
 
-/// Tall full-bleed card — date badge + quiet caption; swipe up/down for photos in the set.
+/// Tall full-bleed card — date badge + quiet caption; swipe up/down for shots in the set.
+/// Dense bursts collapse to one page each so vertical scroll isn’t 25 near-identical frames.
 private struct MomentStoryCard: View {
     let moment: LibraryMoment
     var onLook: (PhotoPeek) -> Void
     var onSetHighlight: (String) -> Void
     var onEditCover: () -> Void
+    var onEditCaption: () -> Void
     var onDelete: () -> Void
-    var onOpenRecap: () -> Void
+    var onOpenRecap: (String) -> Void
+
+    private struct StoryPage: Identifiable, Equatable {
+        /// Stable scroll identity (first photo in the burst) — never swap this mid-scroll.
+        let id: String
+        var displayID: String
+        let groupIDs: [String]
+    }
 
     @State private var pageID: String?
+    @State private var pages: [StoryPage] = []
+    @State private var overflowCount = 0
+    @State private var totalPhotoCount = 0
 
     private let inCardLimit = 12
-    private let tickLimit = 10
     private let overflowPageID = "__overflow__"
 
-    private var orderedIDs: [String] {
-        var ids: [String] = []
-        if !moment.coverID.isEmpty { ids.append(moment.coverID) }
-        for id in moment.photoIDs where id != moment.coverID {
-            ids.append(id)
-        }
-        return ids.isEmpty ? moment.photoIDs : ids
-    }
+    private var pageIDs: [String] { pages.map(\.id) }
 
-    private var pageIDs: [String] {
-        Array(orderedIDs.prefix(inCardLimit))
-    }
-
-    private var overflowCount: Int {
-        max(0, orderedIDs.count - pageIDs.count)
+    private var tickIDs: [String] {
+        overflowCount > 0 ? pageIDs + [overflowPageID] : pageIDs
     }
 
     private var dayNumber: String {
@@ -375,15 +403,33 @@ private struct MomentStoryCard: View {
     }
 
     private var currentIndex: Int {
-        pageIDs.firstIndex(of: currentID) ?? 0
+        tickIDs.firstIndex(of: currentID) ?? 0
+    }
+
+    private var currentDisplayID: String {
+        if currentID == overflowPageID {
+            return pages.last?.displayID ?? moment.coverID
+        }
+        return pages.first { $0.id == currentID }?.displayID ?? currentID
     }
 
     private var isCurrentHighlight: Bool {
-        currentID == moment.coverID
+        currentDisplayID == moment.coverID
     }
 
     private var showsTicks: Bool {
-        pageIDs.count > 1 && pageIDs.count <= tickLimit && overflowCount == 0
+        tickIDs.count > 1
+    }
+
+    private var isNarrowed: Bool {
+        totalPhotoCount > pages.count + overflowCount
+    }
+
+    private func groupIDs(containing id: String) -> [String] {
+        if let page = pages.first(where: { $0.id == id || $0.displayID == id || $0.groupIDs.contains(id) }) {
+            return page.groupIDs
+        }
+        return moment.photoIDs
     }
 
     var body: some View {
@@ -391,24 +437,24 @@ private struct MomentStoryCard: View {
             ZStack {
                 ScrollView(.vertical, showsIndicators: false) {
                     LazyVStack(spacing: 0) {
-                        ForEach(pageIDs, id: \.self) { id in
-                            AssetThumbnail(id: id, targetSize: CGSize(width: 700, height: 1000))
+                        ForEach(pages) { page in
+                            AssetThumbnail(id: page.displayID, targetSize: CGSize(width: 700, height: 1000))
                                 .frame(width: geo.size.width, height: geo.size.height)
                                 .clipped()
                                 .contentShape(Rectangle())
                                 .onTapGesture {
-                                    onOpenRecap()
+                                    onOpenRecap(page.displayID)
                                 }
-                                .id(id)
+                                .id(page.id)
                         }
 
                         if overflowCount > 0 {
                             Button {
-                                onOpenRecap()
+                                onOpenRecap(pages.last?.displayID ?? moment.coverID)
                             } label: {
                                 ZStack {
-                                    if let last = pageIDs.last {
-                                        AssetThumbnail(id: last, targetSize: CGSize(width: 700, height: 1000))
+                                    if let last = pages.last {
+                                        AssetThumbnail(id: last.displayID, targetSize: CGSize(width: 700, height: 1000))
                                             .blur(radius: 18)
                                             .opacity(0.45)
                                     }
@@ -432,15 +478,6 @@ private struct MomentStoryCard: View {
                 }
                 .scrollTargetBehavior(.paging)
                 .scrollPosition(id: $pageID)
-                .onAppear {
-                    if pageID == nil {
-                        pageID = pageIDs.first ?? moment.coverID
-                    }
-                    PhotoLibraryService.shared.startCachingThumbnails(
-                        ids: Array(pageIDs.prefix(6)),
-                        size: CGSize(width: 700, height: 1000)
-                    )
-                }
 
                 LinearGradient(
                     colors: [.clear, .clear, .black.opacity(0.55)],
@@ -453,7 +490,7 @@ private struct MomentStoryCard: View {
                     HStack {
                         Spacer(minLength: 0)
                         VStack(spacing: 5) {
-                            ForEach(Array(pageIDs.indices), id: \.self) { index in
+                            ForEach(Array(tickIDs.indices), id: \.self) { index in
                                 Capsule()
                                     .fill(index == currentIndex ? Color.white : Color.white.opacity(0.28))
                                     .frame(width: 3, height: index == currentIndex ? 18 : 8)
@@ -470,21 +507,22 @@ private struct MomentStoryCard: View {
                         Spacer(minLength: 8)
                         Menu {
                             Button("Look through") {
-                                let start = currentID == overflowPageID
-                                    ? (pageIDs.last ?? moment.coverID)
-                                    : currentID
-                                onLook(PhotoPeek(id: start, groupIDs: moment.photoIDs))
+                                let start = currentDisplayID
+                                onLook(PhotoPeek(id: start, groupIDs: groupIDs(containing: start)))
                             }
                             if currentID != overflowPageID, !isCurrentHighlight {
                                 Button("Set as highlight") {
-                                    onSetHighlight(currentID)
+                                    onSetHighlight(currentDisplayID)
                                 }
                             }
                             Button("Choose highlight…") {
                                 onEditCover()
                             }
+                            Button("Edit caption") {
+                                onEditCaption()
+                            }
                             Button("Curate & share week") {
-                                onOpenRecap()
+                                onOpenRecap(currentDisplayID)
                             }
                             Divider()
                             Button("Delete moment", role: .destructive) {
@@ -502,15 +540,20 @@ private struct MomentStoryCard: View {
                     Spacer(minLength: 0)
 
                     HStack(alignment: .bottom, spacing: 10) {
-                        Text(moment.title.lowercased())
-                            .font(.subheadline.weight(.medium))
-                            .foregroundStyle(.white)
-                            .lineLimit(2)
-                            .shadow(color: .black.opacity(0.45), radius: 6, y: 1)
+                        Button(action: onEditCaption) {
+                            Text(moment.title)
+                                .font(.caption.weight(.medium))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(.ultraThinMaterial, in: Capsule())
+                        }
+                        .buttonStyle(.plain)
 
                         Spacer(minLength: 8)
 
-                        if pageIDs.count > 1 || overflowCount > 0 {
+                        if pages.count > 1 || overflowCount > 0 || isNarrowed {
                             pageLabel
                         }
                     }
@@ -520,26 +563,31 @@ private struct MomentStoryCard: View {
         }
         .clipShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
         .contentShape(RoundedRectangle(cornerRadius: 28, style: .continuous))
-        .onTapGesture(count: 2) {
-            let start = currentID == overflowPageID ? (pageIDs.last ?? moment.coverID) : currentID
-            onLook(PhotoPeek(id: start, groupIDs: moment.photoIDs))
-        }
         .onLongPressGesture(minimumDuration: 0.45) {
             guard currentID != overflowPageID, !isCurrentHighlight else { return }
-            onSetHighlight(currentID)
+            onSetHighlight(currentDisplayID)
         }
         .sensoryFeedback(.selection, trigger: currentID)
+        .onAppear {
+            rebuildPages(resetPosition: pageID == nil)
+        }
+        .onChange(of: moment.photoIDs) { _, _ in
+            rebuildPages(resetPosition: false)
+        }
+        .onChange(of: moment.coverID) { _, cover in
+            applyCover(cover)
+        }
     }
 
     private var pageLabel: some View {
         let label: String = {
             if currentID == overflowPageID {
-                return "\(orderedIDs.count) photos"
+                return "\(totalPhotoCount) photos"
             }
-            if overflowCount > 0 {
-                return "\(currentIndex + 1)/\(pageIDs.count) · \(orderedIDs.count)"
+            if isNarrowed || overflowCount > 0 {
+                return "\(currentIndex + 1)/\(pages.count) · \(totalPhotoCount)"
             }
-            return "\(currentIndex + 1)/\(pageIDs.count)"
+            return "\(currentIndex + 1)/\(pages.count)"
         }()
 
         return Text(label)
@@ -559,6 +607,40 @@ private struct MomentStoryCard: View {
         .frame(width: 44, height: 44)
         .background(.black.opacity(0.38), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
+
+    /// PhotoKit fetch once — never during scroll.
+    private func rebuildPages(resetPosition: Bool) {
+        totalPhotoCount = moment.photoIDs.count
+        let groups = PhotoLibraryService.shared.similarGroups(from: moment.photoIDs, window: 12)
+        let built: [StoryPage] = groups.map { group in
+            let stable = group.photoIDs[0]
+            let display = group.photoIDs.contains(moment.coverID) ? moment.coverID : stable
+            return StoryPage(id: stable, displayID: display, groupIDs: group.photoIDs)
+        }
+        overflowCount = max(0, built.count - inCardLimit)
+        pages = Array(built.prefix(inCardLimit))
+
+        if resetPosition || pageID == nil || !(pageIDs + [overflowPageID]).contains(pageID ?? "") {
+            pageID = pages.first?.id ?? moment.coverID
+        }
+
+        PhotoLibraryService.shared.startCachingThumbnails(
+            ids: Array(pages.prefix(6).map(\.displayID)),
+            size: CGSize(width: 700, height: 1000)
+        )
+    }
+
+    /// Keep scroll identities stable — only swap which frame is shown for the lead burst.
+    private func applyCover(_ cover: String) {
+        guard !cover.isEmpty else { return }
+        for index in pages.indices {
+            if pages[index].groupIDs.contains(cover) {
+                pages[index].displayID = cover
+            } else if pages[index].displayID == cover {
+                pages[index].displayID = pages[index].id
+            }
+        }
+    }
 }
 
 /// Cover picker used by week recap (and anywhere else that swaps a lead photo).
@@ -570,6 +652,63 @@ struct HighlightEditorView: View {
     var onClose: () -> Void
 
     @State private var lookingAt: PhotoPeek?
+    @State private var sections: [ShotSection] = []
+
+    private struct ShotSection: Identifiable {
+        let id: String
+        let title: String?
+        let photoIDs: [String]
+    }
+
+    private func rebuildSections() {
+        let groups = PhotoLibraryService.shared.similarGroups(from: photoIDs, window: 12)
+        let hasMulti = groups.contains { $0.photoIDs.count > 1 }
+        guard hasMulti else {
+            sections = [ShotSection(id: "all", title: nil, photoIDs: photoIDs)]
+            return
+        }
+
+        // Lead’s burst first, then the rest in time order.
+        var ordered = groups
+        if !coverID.isEmpty,
+           let index = ordered.firstIndex(where: { $0.photoIDs.contains(coverID) }),
+           index > 0 {
+            let lead = ordered.remove(at: index)
+            ordered.insert(lead, at: 0)
+        }
+
+        var result: [ShotSection] = []
+        var singles: [String] = []
+
+        func flushSingles() {
+            guard !singles.isEmpty else { return }
+            result.append(
+                ShotSection(
+                    id: "singles-\(singles[0])",
+                    title: result.isEmpty ? nil : "Also",
+                    photoIDs: singles
+                )
+            )
+            singles = []
+        }
+
+        for group in ordered {
+            if group.photoIDs.count == 1 {
+                singles.append(group.photoIDs[0])
+                continue
+            }
+            flushSingles()
+            result.append(
+                ShotSection(
+                    id: group.photoIDs[0],
+                    title: sectionTitle(for: group.photoIDs),
+                    photoIDs: group.photoIDs
+                )
+            )
+        }
+        flushSingles()
+        sections = result
+    }
 
     private var columnCount: Int {
         photoIDs.count <= 4 ? 2 : 3
@@ -582,7 +721,7 @@ struct HighlightEditorView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 24) {
                     VStack(alignment: .leading, spacing: 6) {
                         Text(title)
                             .font(.title2.weight(.bold))
@@ -593,41 +732,26 @@ struct HighlightEditorView: View {
                     }
                     .padding(.horizontal, 20)
 
-                    LazyVGrid(columns: columns, spacing: 8) {
-                        ForEach(photoIDs, id: \.self) { id in
-                            let isCover = id == coverID
-                            Button {
-                                coverID = id
-                            } label: {
-                                Color.clear
-                                    .aspectRatio(1, contentMode: .fit)
-                                    .overlay {
-                                        AssetThumbnail(id: id, targetSize: CGSize(width: 400, height: 400))
-                                    }
-                                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                                    .overlay {
-                                        RoundedRectangle(cornerRadius: 16, style: .continuous)
-                                            .strokeBorder(isCover ? Color.white : Color.clear, lineWidth: 3)
-                                    }
-                                    .overlay(alignment: .bottomTrailing) {
-                                        if isCover {
-                                            Text("Lead")
-                                                .font(.caption2.weight(.bold))
-                                                .foregroundStyle(.black)
-                                                .padding(.horizontal, 8)
-                                                .padding(.vertical, 5)
-                                                .background(.white, in: Capsule())
-                                                .padding(10)
-                                        }
-                                    }
+                    ForEach(sections) { section in
+                        VStack(alignment: .leading, spacing: 10) {
+                            if let title = section.title {
+                                Text(title)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.white.opacity(0.4))
+                                    .padding(.horizontal, 20)
                             }
-                            .buttonStyle(.plain)
+
+                            LazyVGrid(columns: columns, spacing: 8) {
+                                ForEach(section.photoIDs, id: \.self) { id in
+                                    coverTile(id: id)
+                                }
+                            }
+                            .padding(.horizontal, 20)
                         }
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.bottom, 32)
                 }
                 .padding(.top, 8)
+                .padding(.bottom, 32)
             }
             .background(MessageTheme.background.ignoresSafeArea())
             .toolbar {
@@ -653,11 +777,50 @@ struct HighlightEditorView: View {
         }
         .sensoryFeedback(.selection, trigger: coverID)
         .onAppear {
+            rebuildSections()
             PhotoLibraryService.shared.startCachingThumbnails(
                 ids: Array(photoIDs.prefix(60)),
                 size: CGSize(width: 400, height: 400)
             )
         }
+    }
+
+    private func coverTile(id: String) -> some View {
+        let isCover = id == coverID
+        return Button {
+            coverID = id
+        } label: {
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    AssetThumbnail(id: id, targetSize: CGSize(width: 400, height: 400))
+                }
+                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay {
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .strokeBorder(isCover ? Color.white : Color.clear, lineWidth: 3)
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    if isCover {
+                        Text("Lead")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.black)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 5)
+                            .background(.white, in: Capsule())
+                            .padding(10)
+                    }
+                }
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func sectionTitle(for ids: [String]) -> String {
+        let times = PhotoLibraryService.shared.summaries(for: ids).compactMap(\.createdAt).sorted()
+        if let first = times.first {
+            return "\(ids.count) similar · \(first.formatted(date: .omitted, time: .shortened))"
+        }
+        return "\(ids.count) similar"
     }
 }
 

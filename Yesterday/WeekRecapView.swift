@@ -23,6 +23,8 @@ struct WeekRecapView: View {
     @State private var confirmRemove = false
     @State private var isAddingMoment = false
     @State private var isCreatingMoment = false
+    @State private var editingCaptionMoment: LibraryMoment?
+    @State private var captionDraft = ""
 
     /// Prefer live model data (covers / deletes); never resurrect a deleted week from the open snapshot.
     private var week: MomentWeek {
@@ -139,6 +141,26 @@ struct WeekRecapView: View {
             .presentationDetents([.large])
             .preferredColorScheme(.dark)
         }
+        .alert(
+            "Edit caption",
+            isPresented: Binding(
+                get: { editingCaptionMoment != nil },
+                set: { if !$0 { editingCaptionMoment = nil } }
+            )
+        ) {
+            TextField("Caption", text: $captionDraft)
+            Button("Save") {
+                if let moment = editingCaptionMoment {
+                    model.setTitle(captionDraft, for: moment)
+                }
+                editingCaptionMoment = nil
+            }
+            Button("Cancel", role: .cancel) {
+                editingCaptionMoment = nil
+            }
+        } message: {
+            Text("This shows on the highlight and in shared templates.")
+        }
     }
 
     private var swapSessionBinding: Binding<HighlightEditSession?> {
@@ -174,21 +196,31 @@ struct WeekRecapView: View {
                 .padding(.top, 8)
                 .padding(.bottom, 8)
 
-            PhotoBrowserPager(
-                photoIDs: highlightPhotoIDs,
-                currentID: $currentID,
-                isZoomed: $pageZoomed,
-                dismissOffset: $dismissOffset,
-                allowsDismissDrag: false,
-                onSingleTap: {
-                    withAnimation(.easeInOut(duration: 0.15)) {
-                        chromeVisible.toggle()
-                    }
-                },
-                onDismiss: {}
-            )
+            ZStack(alignment: .bottom) {
+                PhotoBrowserPager(
+                    photoIDs: highlightPhotoIDs,
+                    currentID: $currentID,
+                    isZoomed: $pageZoomed,
+                    dismissOffset: $dismissOffset,
+                    allowsDismissDrag: false,
+                    onSingleTap: {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            chromeVisible.toggle()
+                        }
+                    },
+                    onDismiss: {}
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Color.black)
+
+                if chromeVisible && !pageZoomed, let moment = activeMoment {
+                    captionBanner(moment)
+                        .padding(.horizontal, 20)
+                        .padding(.bottom, 16)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+            }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .background(Color.black)
 
             if chromeVisible && !pageZoomed {
                 bottomChrome
@@ -222,21 +254,23 @@ struct WeekRecapView: View {
             }
 
             Spacer(minLength: 0)
-
-            if let moment = activeMoment {
-                VStack(alignment: .trailing, spacing: 2) {
-                    if !moment.dayLabel.isEmpty {
-                        Text(moment.dayLabel)
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.white.opacity(0.55))
-                    }
-                    Text(moment.title)
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.7))
-                        .lineLimit(1)
-                }
-            }
         }
+    }
+
+    /// Caption rides in a soft pill at the foot of the photo — tap to rewrite.
+    private func captionBanner(_ moment: LibraryMoment) -> some View {
+        Button {
+            beginEditCaption(moment)
+        } label: {
+            Text(moment.title)
+                .font(.footnote.weight(.medium))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 8)
+                .background(.ultraThinMaterial, in: Capsule())
+        }
+        .buttonStyle(.plain)
     }
 
     private var bottomChrome: some View {
@@ -291,17 +325,16 @@ struct WeekRecapView: View {
                     }
                     .buttonStyle(.plain)
 
-                    Menu {
-                        Button("Remove from recap", role: .destructive) {
-                            confirmRemove = true
-                        }
+                    Button {
+                        confirmRemove = true
                     } label: {
-                        Image(systemName: "ellipsis")
+                        Image(systemName: "trash")
                             .font(.caption.weight(.bold))
                             .foregroundStyle(.white.opacity(0.55))
                             .frame(width: 28, height: 28)
                             .contentShape(Rectangle())
                     }
+                    .buttonStyle(.plain)
                 }
             }
             .padding(.horizontal, 20)
@@ -373,6 +406,11 @@ struct WeekRecapView: View {
         .buttonStyle(.plain)
     }
 
+    private func beginEditCaption(_ moment: LibraryMoment) {
+        captionDraft = moment.title
+        editingCaptionMoment = moment
+    }
+
     private func removeActiveFromRecap() {
         guard let moment = activeMoment else { return }
         let remaining = moments.filter { $0.id != moment.id }
@@ -391,10 +429,11 @@ struct WeekRecapView: View {
     private func addMoment(photoIDs: [String]) async {
         guard !photoIDs.isEmpty else { return }
         isCreatingMoment = true
+        // Close the sheet immediately so add never feels hung.
+        isAddingMoment = false
         defer { isCreatingMoment = false }
         if let moment = await model.addMoment(photoIDs: photoIDs, to: week.weekStart) {
             currentID = moment.coverID
-            isAddingMoment = false
         }
     }
 
@@ -643,7 +682,8 @@ private extension UIWindowScene {
     }
 }
 
-/// Pick one or more photos from this week to create a new highlight.
+/// Week-only picker, sectioned by day. Thumbnails are loaded into a dictionary so cell
+/// identity can’t drift from what’s on screen.
 private struct AddMomentPickerSheet: View {
     let weekStart: Date
     let dateRange: String
@@ -659,27 +699,19 @@ private struct AddMomentPickerSheet: View {
     }
 
     @State private var sections: [DaySection] = []
+    @State private var thumbnails: [String: UIImage] = [:]
     @State private var selectedOrder: [String] = []
     @State private var didLoad = false
-    @State private var showUsed = false
+    @State private var loadError: String?
 
-    private let spacing: CGFloat = 2
-    private let columns = Array(repeating: GridItem(.flexible(), spacing: 2), count: 3)
+    private let gap: CGFloat = 3
+    private let columns = 3
 
     private var weekEnd: Date {
         Calendar.current.date(byAdding: .day, value: 7, to: weekStart) ?? weekStart
     }
 
     private var selectedSet: Set<String> { Set(selectedOrder) }
-
-    private var visibleSections: [DaySection] {
-        guard !showUsed else { return sections }
-        return sections.compactMap { section in
-            let ids = section.photoIDs.filter { !usedPhotoIDs.contains($0) }
-            guard !ids.isEmpty else { return nil }
-            return DaySection(id: section.id, label: section.label, photoIDs: ids)
-        }
-    }
 
     var body: some View {
         NavigationStack {
@@ -689,27 +721,31 @@ private struct AddMomentPickerSheet: View {
                 if !didLoad {
                     ProgressView()
                         .tint(.white)
-                } else if visibleSections.isEmpty {
-                    emptyState
+                } else if let loadError {
+                    Text(loadError)
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.5))
+                        .padding(24)
+                } else if sections.isEmpty {
+                    Text("No photos from \(dateRange).")
+                        .font(.subheadline)
+                        .foregroundStyle(.white.opacity(0.5))
+                        .padding(24)
                 } else {
                     VStack(spacing: 0) {
                         ScrollView {
-                            LazyVStack(alignment: .leading, spacing: 18) {
-                                ForEach(visibleSections) { section in
+                            LazyVStack(alignment: .leading, spacing: 20, pinnedViews: []) {
+                                ForEach(sections) { section in
                                     Text(section.label)
                                         .font(.subheadline.weight(.semibold))
                                         .foregroundStyle(.white.opacity(0.55))
                                         .padding(.horizontal, 16)
 
-                                    LazyVGrid(columns: columns, spacing: spacing) {
-                                        ForEach(section.photoIDs, id: \.self) { id in
-                                            photoCell(id)
-                                                .id(id)
-                                        }
-                                    }
+                                    photoGrid(section.photoIDs)
+                                        .padding(.horizontal, 2)
                                 }
                             }
-                            .padding(.bottom, selectedOrder.isEmpty ? 24 : 110)
+                            .padding(.bottom, selectedOrder.isEmpty ? 24 : 120)
                         }
 
                         if !selectedOrder.isEmpty {
@@ -726,39 +762,88 @@ private struct AddMomentPickerSheet: View {
                         .foregroundStyle(.white)
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    if usedPhotoIDs.contains(where: { id in
-                        sections.contains { $0.photoIDs.contains(id) }
-                    }) {
-                        Button(showUsed ? "Hide used" : "Show used") {
-                            showUsed.toggle()
+                    Button {
+                        onAdd(selectedOrder)
+                    } label: {
+                        if isCreating {
+                            ProgressView().controlSize(.small).tint(.white)
+                        } else {
+                            Text(selectedOrder.isEmpty ? "Add" : "Add \(selectedOrder.count)")
+                                .fontWeight(.semibold)
                         }
-                        .font(.subheadline.weight(.medium))
-                        .foregroundStyle(.white.opacity(0.7))
                     }
+                    .disabled(selectedOrder.isEmpty || isCreating)
+                    .foregroundStyle(.white)
                 }
             }
             .toolbarBackground(.visible, for: .navigationBar)
             .toolbarBackground(Color.black, for: .navigationBar)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .sensoryFeedback(.selection, trigger: selectedOrder.count)
-            .task { await loadPhotos() }
+            .task { await loadWeekPhotos() }
         }
     }
 
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Text(showUsed ? "No photos from \(dateRange)." : "Nothing left to add")
-                .font(.headline.weight(.semibold))
-                .foregroundStyle(.white)
-            if !showUsed, sections.contains(where: { $0.photoIDs.contains(where: usedPhotoIDs.contains) }) {
-                Button("Show photos already in this week") {
-                    showUsed = true
-                }
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.7))
+    private var gridColumns: [GridItem] {
+        Array(repeating: GridItem(.flexible(), spacing: gap), count: columns)
+    }
+
+    private func photoGrid(_ ids: [String]) -> some View {
+        LazyVGrid(columns: gridColumns, spacing: gap) {
+            ForEach(ids, id: \.self) { id in
+                photoCell(id)
             }
         }
-        .padding(24)
+    }
+
+    private func photoCell(_ id: String) -> some View {
+        let isOn = selectedSet.contains(id)
+        let orderIndex = selectedOrder.firstIndex(of: id)
+        let alreadyUsed = usedPhotoIDs.contains(id)
+
+        return Button {
+            toggle(id)
+        } label: {
+            Color.clear
+                .aspectRatio(1, contentMode: .fit)
+                .overlay {
+                    Group {
+                        if let image = thumbnails[id] {
+                            Image(uiImage: image)
+                                .resizable()
+                                .scaledToFill()
+                        } else {
+                            Color.white.opacity(0.08)
+                        }
+                    }
+                }
+                .overlay {
+                    if isOn {
+                        Color.black.opacity(0.28)
+                    } else if alreadyUsed {
+                        Color.black.opacity(0.35)
+                    }
+                }
+                .overlay(alignment: .bottomTrailing) {
+                    ZStack {
+                        Circle()
+                            .fill(isOn ? Color.white : Color.black.opacity(0.35))
+                            .frame(width: 24, height: 24)
+                        Circle()
+                            .strokeBorder(Color.white, lineWidth: 1.5)
+                            .frame(width: 24, height: 24)
+                        if let orderIndex {
+                            Text("\(orderIndex + 1)")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(.black)
+                        }
+                    }
+                    .padding(6)
+                }
+                .clipped()
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     private var selectionDock: some View {
@@ -769,11 +854,19 @@ private struct AddMomentPickerSheet: View {
                     HStack(spacing: 8) {
                         ForEach(selectedOrder, id: \.self) { id in
                             ZStack(alignment: .topTrailing) {
-                                AssetThumbnail(id: id, targetSize: CGSize(width: 120, height: 120))
-                                    .id(id)
-                                    .frame(width: 52, height: 52)
-                                    .clipped()
-                                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                                Group {
+                                    if let image = thumbnails[id] {
+                                        Image(uiImage: image)
+                                            .resizable()
+                                            .scaledToFill()
+                                    } else {
+                                        Color.white.opacity(0.1)
+                                    }
+                                }
+                                .frame(width: 52, height: 52)
+                                .clipped()
+                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
                                 Button {
                                     selectedOrder.removeAll { $0 == id }
                                 } label: {
@@ -794,9 +887,7 @@ private struct AddMomentPickerSheet: View {
                 } label: {
                     Group {
                         if isCreating {
-                            ProgressView()
-                                .controlSize(.small)
-                                .tint(.black)
+                            ProgressView().controlSize(.small).tint(.black)
                         } else {
                             Text("Add \(selectedOrder.count)")
                                 .font(.subheadline.weight(.semibold))
@@ -816,44 +907,6 @@ private struct AddMomentPickerSheet: View {
         }
     }
 
-    private func photoCell(_ id: String) -> some View {
-        let isOn = selectedSet.contains(id)
-        let index = selectedOrder.firstIndex(of: id)
-
-        return Button {
-            toggle(id)
-        } label: {
-            ZStack(alignment: .bottomTrailing) {
-                AssetThumbnail(id: id, targetSize: CGSize(width: 280, height: 280))
-                    .id(id)
-                    .aspectRatio(1, contentMode: .fill)
-                    .frame(minWidth: 0, maxWidth: .infinity)
-                    .clipped()
-
-                if isOn {
-                    Color.black.opacity(0.28)
-                }
-
-                ZStack {
-                    Circle()
-                        .fill(isOn ? Color.white : Color.black.opacity(0.35))
-                        .frame(width: 24, height: 24)
-                    Circle()
-                        .strokeBorder(Color.white, lineWidth: 1.5)
-                        .frame(width: 24, height: 24)
-                    if let index {
-                        Text("\(index + 1)")
-                            .font(.caption2.weight(.bold))
-                            .foregroundStyle(.black)
-                    }
-                }
-                .padding(6)
-            }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
     private func toggle(_ id: String) {
         if let index = selectedOrder.firstIndex(of: id) {
             selectedOrder.remove(at: index)
@@ -863,44 +916,79 @@ private struct AddMomentPickerSheet: View {
     }
 
     @MainActor
-    private func loadPhotos() async {
+    private func loadWeekPhotos() async {
         let photos = PhotoLibraryService.shared.search(
             start: weekStart,
             end: weekEnd,
             favoritesOnly: false,
             albumName: nil,
-            limit: 240,
+            limit: 300,
             includeScreenshots: true
         )
 
         let calendar = Calendar.current
-        var buckets: [Date: [String]] = [:]
-        var order: [Date] = []
+        var buckets: [Date: [(id: String, date: Date?)]] = [:]
 
         for photo in photos {
             let day = calendar.startOfDay(for: photo.createdAt ?? weekStart)
-            if buckets[day] == nil {
-                order.append(day)
-                buckets[day] = []
-            }
-            buckets[day, default: []].append(photo.localIdentifier)
+            buckets[day, default: []].append((photo.localIdentifier, photo.createdAt))
         }
 
-        sections = order.map { day in
-            DaySection(
-                id: day,
-                label: daySectionLabel(day),
-                photoIDs: buckets[day] ?? []
+        // Newest day first (Sun → Mon), newest photos first within each day.
+        sections = (0..<7).reversed().compactMap { offset -> DaySection? in
+            guard let day = calendar.date(byAdding: .day, value: offset, to: calendar.startOfDay(for: weekStart))
+            else { return nil }
+            let dayStart = calendar.startOfDay(for: day)
+            guard var items = buckets[dayStart], !items.isEmpty else { return nil }
+            items.sort { ($0.date ?? .distantPast) > ($1.date ?? .distantPast) }
+            return DaySection(
+                id: dayStart,
+                label: daySectionLabel(dayStart),
+                photoIDs: items.map(\.id)
             )
         }
+
         didLoad = true
+
+        let allIDs = sections.flatMap(\.photoIDs)
+        PhotoLibraryService.shared.startCachingThumbnails(
+            ids: Array(allIDs.prefix(60)),
+            size: CGSize(width: 240, height: 240)
+        )
+
+        // Load thumbs in small concurrent batches so the sheet doesn’t freeze.
+        let batchSize = 12
+        var index = 0
+        while index < allIDs.count {
+            if Task.isCancelled { return }
+            let batch = Array(allIDs[index..<min(index + batchSize, allIDs.count)])
+            await withTaskGroup(of: (String, UIImage?).self) { group in
+                for id in batch {
+                    group.addTask {
+                        let image = await PhotoLibraryService.shared.requestThumbnail(
+                            for: id,
+                            size: CGSize(width: 240, height: 240)
+                        )
+                        return (id, image)
+                    }
+                }
+                for await (id, image) in group {
+                    if let image {
+                        thumbnails[id] = image
+                    }
+                }
+            }
+            index += batchSize
+        }
     }
 
     private func daySectionLabel(_ day: Date) -> String {
         let calendar = Calendar.current
         if calendar.isDateInToday(day) { return "Today" }
         if calendar.isDateInYesterday(day) { return "Yesterday" }
-        return DateFormatter.chipDayNoYear.string(from: day)
+        let weekday = DateFormatter.weekdayShort.string(from: day)
+        let date = DateFormatter.chipDayNoYear.string(from: day)
+        return "\(weekday) · \(date)"
     }
 }
 
