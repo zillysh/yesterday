@@ -477,8 +477,13 @@ final class PhotoLibraryService: @unchecked Sendable {
         let photoIDs: [String]
     }
 
+    private var similarGroupsCache: [String: [SimilarGroup]] = [:]
+
     /// Bursts and shots taken a few seconds apart — the same moment, not the whole night.
     func similarGroups(from ids: [String], window: TimeInterval = 8) -> [SimilarGroup] {
+        let cacheKey = "\(Int(window))|" + ids.joined(separator: ",")
+        if let cached = similarGroupsCache[cacheKey] { return cached }
+
         let photos = summaries(for: ids)
         let byID = Dictionary(uniqueKeysWithValues: photos.map { ($0.localIdentifier, $0) })
         var groups: [[String]] = []
@@ -502,7 +507,13 @@ final class PhotoLibraryService: @unchecked Sendable {
             }
             groups.append([id])
         }
-        return groups.map { SimilarGroup(photoIDs: $0) }
+        let result = groups.map { SimilarGroup(photoIDs: $0) }
+        // Bound memory — story cards + highlight sheets are short-lived keys.
+        if similarGroupsCache.count > 40 {
+            similarGroupsCache.removeAll(keepingCapacity: true)
+        }
+        similarGroupsCache[cacheKey] = result
+        return result
     }
 
     func requestThumbnail(for id: String, size: CGSize) async -> UIImage? {

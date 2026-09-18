@@ -409,7 +409,7 @@ enum DatePhrase {
 
     private static func weekStart(for day: Date) -> Date {
         var calendar = Calendar.current
-        calendar.firstWeekday = 1
+        calendar.firstWeekday = 2 // Monday
         let comps = calendar.dateComponents([.yearForWeekOfYear, .weekOfYear], from: day)
         return calendar.date(from: comps) ?? day
     }

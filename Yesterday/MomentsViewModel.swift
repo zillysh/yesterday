@@ -171,7 +171,9 @@ final class MomentsViewModel {
         for (offset, event) in events.enumerated() {
             guard generation == refreshGeneration else { return }
             let ids = event.photos.map(\.localIdentifier)
-            let sortDate = event.photos.compactMap(\.createdAt).max() ?? event.eventDay
+            let newest = event.photos.compactMap(\.createdAt).max() ?? event.eventDay
+            // Keep sortDate inside the event’s Monday–Sunday week (don’t spill on late nights).
+            let sortDate = Self.clampedToEventWeek(newest, eventDay: event.eventDay)
             let timeTitle = Self.timeTitle(for: event)
             // Activity first when we have a vibe; when is always supporting context.
             var title = timeTitle
@@ -206,6 +208,9 @@ final class MomentsViewModel {
         guard generation == refreshGeneration else { return }
         for i in finalized.indices {
             finalized[i].title = placed[i]
+            if let custom = MomentTitleStore.title(for: finalized[i].clusterKey) {
+                finalized[i].title = custom
+            }
         }
 
         // Single assignment — titles are final when the feed appears.
@@ -230,19 +235,26 @@ final class MomentsViewModel {
 
     // MARK: - Weeks
 
+    /// Gregorian Monday–Sunday weeks in the user’s time zone.
+    private static func mondayCalendar() -> Calendar {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .current
+        calendar.firstWeekday = 2 // Monday
+        calendar.minimumDaysInFirstWeek = 4
+        return calendar
+    }
+
     /// Spread moments across weeks so a busy recent stretch doesn’t hide older weeks.
     private static func balancedEvents(
         _ clusters: [PhotoLibraryService.PhotoEvent],
         maxWeeks: Int,
         maxPerWeek: Int
     ) -> [PhotoLibraryService.PhotoEvent] {
-        var calendar = Calendar.current
-        calendar.firstWeekday = 1
-
+        let calendar = mondayCalendar()
         var byWeek: [Date: [PhotoLibraryService.PhotoEvent]] = [:]
         for event in clusters {
-            let date = event.photos.compactMap(\.createdAt).max() ?? event.eventDay
-            let start = weekStart(for: date, calendar: calendar)
+            // eventDay keeps late-night (after-midnight) clusters with the night they belong to.
+            let start = weekStart(for: event.eventDay, calendar: calendar)
             byWeek[start, default: []].append(event)
         }
 
@@ -250,7 +262,10 @@ final class MomentsViewModel {
         var picked: [PhotoLibraryService.PhotoEvent] = []
         picked.reserveCapacity(maxWeeks * maxPerWeek)
         for start in weekStarts {
-            let weekEvents = byWeek[start] ?? []
+            let weekEvents = (byWeek[start] ?? []).sorted {
+                ($0.photos.compactMap(\.createdAt).max() ?? .distantPast)
+                    > ($1.photos.compactMap(\.createdAt).max() ?? .distantPast)
+            }
             picked.append(contentsOf: weekEvents.prefix(maxPerWeek))
         }
         return picked.sorted {
@@ -279,9 +294,45 @@ final class MomentsViewModel {
         }
     }
 
+    func setTitle(_ title: String, for moment: LibraryMoment) {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        MomentTitleStore.set(trimmed, for: moment.clusterKey)
+
+        var next = weeks
+        var changed = false
+        for weekIndex in next.indices {
+            for momentIndex in next[weekIndex].moments.indices {
+                let row = next[weekIndex].moments[momentIndex]
+                if row.id == moment.id || row.clusterKey == moment.clusterKey {
+                    next[weekIndex].moments[momentIndex].title = trimmed
+                    changed = true
+                }
+            }
+        }
+        if changed {
+            weeks = next
+        }
+
+        // Keep hand-added moments in sync.
+        let manuals = ManualMomentsStore.all()
+        if let match = manuals.first(where: { LibraryMoment.makeClusterKey($0.photoIDs) == moment.clusterKey }) {
+            ManualMomentsStore.add(
+                ManualMomentRecord(
+                    weekStart: match.weekStart,
+                    photoIDs: match.photoIDs,
+                    coverID: match.coverID,
+                    title: trimmed,
+                    sortDate: match.sortDate
+                )
+            )
+        }
+    }
+
     func deleteMoment(_ moment: LibraryMoment) {
         DismissedMomentsStore.dismiss(moment.clusterKey)
         ManualMomentsStore.remove(clusterKey: moment.clusterKey)
+        MomentTitleStore.remove(for: moment.clusterKey)
         let next = weeks.compactMap { week -> MomentWeek? in
             let kept = week.moments.filter { $0.id != moment.id && $0.clusterKey != moment.clusterKey }
             guard !kept.isEmpty else { return nil }
@@ -308,7 +359,8 @@ final class MomentsViewModel {
         let sortDate = summaries.compactMap(\.createdAt).max()
             ?? Calendar.current.startOfDay(for: weekStart)
         let day = Self.dayLabel(for: sortDate)
-        let title = await Self.vibeTitle(for: ids) ?? (day.isEmpty ? "Moment" : day)
+        // Don't await vibe classification here — it can hang the add sheet.
+        let title = day.isEmpty ? "Moment" : day
         let cover = ids[0]
         let moment = LibraryMoment(
             title: title,
@@ -319,8 +371,7 @@ final class MomentsViewModel {
             dayLabel: day
         )
 
-        var calendar = Calendar.current
-        calendar.firstWeekday = 1
+        let calendar = Self.mondayCalendar()
         let start = Self.weekStart(for: weekStart, calendar: calendar)
 
         ManualMomentsStore.add(
@@ -353,6 +404,29 @@ final class MomentsViewModel {
         }
         weeks = next
         note = nil
+
+        // Soft-title in the background once embeddings are ready.
+        let momentID = moment.id
+        let clusterKey = moment.clusterKey
+        Task { @MainActor in
+            // Don't overwrite a caption the user already set.
+            if MomentTitleStore.title(for: clusterKey) != nil { return }
+            guard let vibe = await Self.vibeTitle(for: ids) else { return }
+            guard let weekIndex = weeks.firstIndex(where: { Calendar.current.isDate($0.weekStart, inSameDayAs: start) }),
+                  let momentIndex = weeks[weekIndex].moments.firstIndex(where: { $0.id == momentID })
+            else { return }
+            weeks[weekIndex].moments[momentIndex].title = vibe
+            ManualMomentsStore.add(
+                ManualMomentRecord(
+                    weekStart: start.timeIntervalSince1970,
+                    photoIDs: ids,
+                    coverID: cover,
+                    title: vibe,
+                    sortDate: sortDate.timeIntervalSince1970
+                )
+            )
+        }
+
         return moment
     }
 
@@ -366,8 +440,7 @@ final class MomentsViewModel {
     }
 
     private static func weeks(from moments: [LibraryMoment]) -> [MomentWeek] {
-        var calendar = Calendar.current
-        calendar.firstWeekday = 1 // Sunday-start weeks
+        let calendar = mondayCalendar()
 
         var buckets: [Date: [LibraryMoment]] = [:]
         for moment in moments {
@@ -391,20 +464,20 @@ final class MomentsViewModel {
         let records = ManualMomentsStore.all()
         guard !records.isEmpty else { return weeks }
 
-        var calendar = Calendar.current
-        calendar.firstWeekday = 1
+        let calendar = mondayCalendar()
         var next = weeks
 
         for record in records {
-            let start = Date(timeIntervalSince1970: record.weekStart)
             let ids = record.photoIDs.filter { !$0.isEmpty }
             guard !ids.isEmpty else { continue }
             let key = LibraryMoment.makeClusterKey(ids)
             if DismissedMomentsStore.isDismissed(key) { continue }
 
             let sortDate = Date(timeIntervalSince1970: record.sortDate)
+            // Re-derive Monday week from the photos’ date — ignores stale Sunday-based stores.
+            let start = weekStart(for: sortDate, calendar: calendar)
             let moment = LibraryMoment(
-                title: record.title,
+                title: MomentTitleStore.title(for: key) ?? record.title,
                 subtitle: "\(ids.count) photos",
                 photoIDs: ids,
                 coverID: ids.contains(record.coverID) ? record.coverID : ids[0],
@@ -413,7 +486,7 @@ final class MomentsViewModel {
                 clusterKey: key
             )
 
-            if let index = next.firstIndex(where: { Calendar.current.isDate($0.weekStart, inSameDayAs: start) }) {
+            if let index = next.firstIndex(where: { calendar.isDate($0.weekStart, inSameDayAs: start) }) {
                 if next[index].moments.contains(where: { $0.clusterKey == key }) { continue }
                 next[index].moments.insert(moment, at: 0)
             } else {
@@ -421,7 +494,7 @@ final class MomentsViewModel {
                     MomentWeek(
                         title: weekTitle(for: start, calendar: calendar),
                         dateRange: weekDateRange(for: start, calendar: calendar),
-                        weekStart: calendar.startOfDay(for: start),
+                        weekStart: start,
                         moments: [moment]
                     )
                 )
@@ -431,18 +504,38 @@ final class MomentsViewModel {
         return next.sorted { $0.weekStart > $1.weekStart }
     }
 
-    private static func weekStart(for date: Date, calendar: Calendar) -> Date {
+    private static func weekStart(for date: Date, calendar: Calendar? = nil) -> Date {
+        let calendar = calendar ?? mondayCalendar()
         let day = calendar.startOfDay(for: date)
         let weekday = calendar.component(.weekday, from: day)
         let delta = (weekday - calendar.firstWeekday + 7) % 7
         return calendar.date(byAdding: .day, value: -delta, to: day) ?? day
     }
 
+    /// If the newest photo crossed into the next Monday week (late Sunday night → Mon 1am),
+    /// pin sortDate to the event’s week so sections stay accurate.
+    private static func clampedToEventWeek(_ newest: Date, eventDay: Date) -> Date {
+        let calendar = mondayCalendar()
+        let eventWeek = weekStart(for: eventDay, calendar: calendar)
+        let newestWeek = weekStart(for: newest, calendar: calendar)
+        if eventWeek == newestWeek { return newest }
+        // Place at end of the event’s Sunday so ordering within the week stays late.
+        let sunday = calendar.date(byAdding: .day, value: 6, to: eventWeek) ?? eventDay
+        let time = calendar.dateComponents([.hour, .minute, .second], from: newest)
+        return calendar.date(
+            bySettingHour: time.hour ?? 23,
+            minute: time.minute ?? 59,
+            second: time.second ?? 59,
+            of: sunday
+        ) ?? sunday
+    }
+
     private static func weekTitle(for start: Date, calendar: Calendar) -> String {
         let today = calendar.startOfDay(for: Date())
         let thisWeek = weekStart(for: today, calendar: calendar)
-        if start == thisWeek { return "This week" }
-        if let last = calendar.date(byAdding: .day, value: -7, to: thisWeek), start == last {
+        if calendar.isDate(start, inSameDayAs: thisWeek) { return "This week" }
+        if let last = calendar.date(byAdding: .day, value: -7, to: thisWeek),
+           calendar.isDate(start, inSameDayAs: last) {
             return "Last week"
         }
         return weekDateRange(for: start, calendar: calendar)
@@ -749,6 +842,43 @@ enum HighlightCoverStore {
 
     private static func storageKey(for clusterKey: String) -> String {
         // Short stable fingerprint so UserDefaults keys stay small.
+        var hash: UInt64 = 5381
+        for byte in clusterKey.utf8 {
+            hash = ((hash << 5) &+ hash) &+ UInt64(byte)
+        }
+        return String(hash, radix: 16)
+    }
+}
+
+// MARK: - Caption / title overrides
+
+enum MomentTitleStore {
+    private static let defaultsKey = "moments.titleOverrides"
+
+    static func title(for clusterKey: String) -> String? {
+        guard let map = UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: String],
+              let title = map[storageKey(for: clusterKey)]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty
+        else { return nil }
+        return title
+    }
+
+    static func set(_ title: String, for clusterKey: String) {
+        var map = (UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: String]) ?? [:]
+        map[storageKey(for: clusterKey)] = title
+        if map.count > 200 {
+            map = Dictionary(uniqueKeysWithValues: map.suffix(200))
+        }
+        UserDefaults.standard.set(map, forKey: defaultsKey)
+    }
+
+    static func remove(for clusterKey: String) {
+        var map = (UserDefaults.standard.dictionary(forKey: defaultsKey) as? [String: String]) ?? [:]
+        map.removeValue(forKey: storageKey(for: clusterKey))
+        UserDefaults.standard.set(map, forKey: defaultsKey)
+    }
+
+    private static func storageKey(for clusterKey: String) -> String {
         var hash: UInt64 = 5381
         for byte in clusterKey.utf8 {
             hash = ((hash << 5) &+ hash) &+ UInt64(byte)
